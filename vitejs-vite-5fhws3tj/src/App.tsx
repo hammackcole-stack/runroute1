@@ -121,18 +121,17 @@ export default function App() {
     }
   }, [routeData, startLatLng, start, selectedRouteIndex]);
 
-  // Style helper for “show all routes”
+  // Style helper for "show all routes"
   // Selected = neon green, hovered (not selected) = dim white preview, others = dark
   const routeStyle = (idx: number) => {
     const isSel = idx === selectedRouteIndex;
     const isHov = idx === hoveredRouteIndex && !isSel;
-    return {
-      color: isSel ? “#ccff00” : isHov ? “#ffffff” : “#3f3f46”,
-      weight: isSel ? 6 : isHov ? 4 : 3,
-      opacity: isSel ? 0.95 : isHov ? 0.7 : 0.45,
-      lineCap: “square” as const,
-      lineJoin: “miter” as const,
-    };
+    let color = '#3f3f46';
+    let weight = 3;
+    let opacity = 0.45;
+    if (isSel) { color = '#ccff00'; weight = 6; opacity = 0.95; }
+    else if (isHov) { color = '#ffffff'; weight = 4; opacity = 0.7; }
+    return { color, weight, opacity, lineCap: 'square' as const, lineJoin: 'miter' as const };
   };
 
   const selectedFeature = useMemo(() => {
