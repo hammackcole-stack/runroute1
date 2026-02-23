@@ -161,12 +161,10 @@ export default function App() {
   };
 
   // Safe accessor for the currently selected feature
-  const selectedFeature = routeData?.features?.[selectedRouteIndex];
-  const properties = selectedFeature?.properties;
-  const metrics = properties?.metrics;
-  const scoring = properties?.scoring;
-  const warnings = properties?.warnings || [];
-  const elevationProfile = properties?.elevationProfile;
+const selectedFeature = routeData?.features?.[selectedRouteIndex];
+const properties = selectedFeature?.properties;
+const warnings = properties?.warnings || [];
+const elevationProfile = properties?.elevationProfile;
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full bg-black text-white overflow-hidden font-sans">
