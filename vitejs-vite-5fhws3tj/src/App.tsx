@@ -489,6 +489,9 @@ export default function App() {
                 const isSelected = selectedRouteIndex === idx;
                 const featMetrics = feature.properties.metrics;
                 const featScoring = feature.properties.scoring;
+                const parkName: string | null = feature.properties.parkName ?? null;
+                const parkLoopMi: number | null = feature.properties.parkLoopDistanceMiles ?? null;
+                const transitMi: number | null = feature.properties.transitDistanceMiles ?? null;
 
                 return (
                   <button
@@ -537,6 +540,20 @@ export default function App() {
                         </p>
                       </div>
                     </div>
+
+                    {parkName && parkLoopMi != null && (
+                      <div className="mt-3 pt-3 border-t border-zinc-800 space-y-1">
+                        <p className="text-[10px] font-bold text-neon uppercase tracking-widest truncate">
+                          {parkName}
+                        </p>
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest">
+                          {parkLoopMi} mi trail loop
+                          {transitMi != null && (
+                            <span className="text-zinc-700"> · {transitMi} mi transit</span>
+                          )}
+                        </p>
+                      </div>
+                    )}
                   </button>
                 );
               })}
