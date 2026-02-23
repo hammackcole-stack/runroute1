@@ -1,17 +1,18 @@
 // api/route.ts — Vercel Serverless Function (Node.js runtime)
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-type LatLon = [number, number]; // [lat, lon]  — GraphHopper format
-type LonLat = [number, number]; // [lon, lat]  — GeoJSON format
+type LatLon = [number, number]; // [lat, lon] — GraphHopper format
+type LonLat = [number, number]; // [lon, lat] — GeoJSON format
 
 const GH_TIMEOUT_MS = 8_000;
+const OVERPASS_TIMEOUT_MS = 8_000;
+const GH_STAGGER_MS = 300;
 
 // ── coordinate helpers ────────────────────────────────────────────────────────
 
 function metersToLon(m: number, lat: number) {
   return m / (111320 * Math.cos((lat * Math.PI) / 180));
 }
-
 function metersToLat(m: number) {
   return m / 110540;
 }
@@ -32,60 +33,63 @@ function normalizeLatLon(p: unknown, label = "point"): LatLon {
   return [a, b];
 }
 
-// ── waypoint builder ──────────────────────────────────────────────────────────
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── waypoint builders ─────────────────────────────────────────────────────────
 
 /**
- * Builds the GH waypoint array for a single route.
- *
- * Loop: places 3 intermediate waypoints at 120° intervals starting at bearingDeg,
- * forming a triangle that GH will route around — each bearing offset produces a
- * genuinely different loop shape.
- *
- * Out-and-back: single midpoint in the bearing direction.
+ * Waypoints for out-and-back: one midpoint in the bearing direction.
+ * (Standard loop no longer uses this — it uses GH round_trip instead.)
  */
-function buildWaypoints(
+function buildOutAndBackWaypoints(
   lat: number,
   lon: number,
   targetMeters: number,
-  type: "loop" | "out-and-back",
   bearingDeg: number
 ): LatLon[] {
   const b = (bearingDeg * Math.PI) / 180;
+  const oneWay = targetMeters / 2;
+  const mid: LatLon = [
+    lat + metersToLat(oneWay * Math.sin(b)),
+    lon + metersToLon(oneWay * Math.cos(b), lat),
+  ];
+  return [[lat, lon], mid, [lat, lon]];
+}
 
-  if (type === "out-and-back") {
-    const oneWay = targetMeters / 2;
-    const mid: LatLon = [
-      lat + metersToLat(oneWay * Math.sin(b)),
-      lon + metersToLon(oneWay * Math.cos(b), lat),
-    ];
-    return [[lat, lon], mid, [lat, lon]];
-  }
-
-  // Loop: 3 waypoints at 120° increments starting at bearingDeg
-  const r = targetMeters / (2 * Math.PI);
-  const pts: LatLon[] = [[lat, lon]];
+/**
+ * Waypoints for park loop:
+ *   start → 3 points inside the park (120° apart) → start
+ *
+ * The 3 inner points form a triangle around the park center so GH creates a
+ * real loop inside the park rather than an out-and-back through it.
+ * rotationDeg rotates the triangle to produce distinct loop shapes across the
+ * 3 route variants and across multiple Generate clicks.
+ */
+function buildParkWaypoints(
+  startLat: number,
+  startLon: number,
+  parkLat: number,
+  parkLon: number,
+  rotationDeg: number
+): LatLon[] {
+  const innerR = 150; // meters from park center — tune if parks feel too tight/loose
+  const pts: LatLon[] = [[startLat, startLon]];
   for (let i = 0; i < 3; i++) {
-    const a = ((bearingDeg + i * 120) * Math.PI) / 180;
+    const angle = ((rotationDeg + i * 120) * Math.PI) / 180;
     pts.push([
-      lat + metersToLat(r * Math.sin(a)),
-      lon + metersToLon(r * Math.cos(a), lat),
+      parkLat + metersToLat(innerR * Math.sin(angle)),
+      parkLon + metersToLon(innerR * Math.cos(angle), parkLat),
     ]);
   }
-  pts.push([lat, lon]);
+  pts.push([startLat, startLon]);
   return pts;
 }
 
 // ── mock geometry (fallback) ──────────────────────────────────────────────────
 
-/**
- * Closed loop that starts and ends at startLonLat.
- * Circle centered north of start so its southernmost point = startLonLat.
- */
-function makeLoop(
-  startLonLat: LonLat,
-  targetMeters: number,
-  hilliness: "flat" | "hills"
-): LonLat[] {
+function makeLoop(startLonLat: LonLat, targetMeters: number, hilliness: "flat" | "hills"): LonLat[] {
   const numPts = 70;
   const radius = targetMeters / (2 * Math.PI);
   const centerLat = startLonLat[1] + metersToLat(radius);
@@ -103,11 +107,7 @@ function makeLoop(
   return coords;
 }
 
-function makeOutAndBack(
-  startLonLat: LonLat,
-  targetMeters: number,
-  bearingDeg: number
-): LonLat[] {
+function makeOutAndBack(startLonLat: LonLat, targetMeters: number, bearingDeg: number): LonLat[] {
   const oneWay = targetMeters / 2;
   const b = (bearingDeg * Math.PI) / 180;
   const out: LonLat = [
@@ -117,11 +117,9 @@ function makeOutAndBack(
   return [startLonLat, out, startLonLat];
 }
 
-function fakeElevationProfile(
-  lenMeters: number,
-  pref: "flat" | "hills",
-  intensity = 1
-): { distanceMeters: number; elevation: number }[] {
+// ── elevation / scoring ───────────────────────────────────────────────────────
+
+function fakeElevationProfile(lenMeters: number, pref: "flat" | "hills", intensity = 1) {
   const pts = 50;
   const base = 120;
   const amp = (pref === "hills" ? 35 : 8) * intensity;
@@ -152,160 +150,152 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills"): number {
   );
 }
 
-// ── GraphHopper client ────────────────────────────────────────────────────────
+// ── GH API ───────────────────────────────────────────────────────────────────
 
-/** Small pause between sequential GH calls to stay within free-tier rate limits. */
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function graphHopperRoute(points: LatLon[], key: string, profile: string) {
-  // GH POST body expects [lon, lat] — swap after normalizing
-  const safePoints = points.map((p, i) => {
-    const [lat, lon] = normalizeLatLon(p, `point ${i}`);
-    return [lon, lat];
-  });
-
-  const ghUrl = new URL("https://graphhopper.com/api/1/route");
-  ghUrl.searchParams.set("key", key);
-
-  const requestBody = {
-    points: safePoints,
-    profile,
-    points_encoded: false,
-    instructions: false,
-    calc_points: true,
-    elevation: true,
-  };
+async function ghPost(key: string, body: object): Promise<any> {
+  const url = new URL("https://graphhopper.com/api/1/route");
+  url.searchParams.set("key", key);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GH_TIMEOUT_MS);
-
-  let ghResp: Response;
+  let resp: Response;
   try {
-    ghResp = await fetch(ghUrl.toString(), {
+    resp = await fetch(url.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
   } finally {
     clearTimeout(timer);
   }
 
-  const ghJson: any = await ghResp.json().catch(() => ({}));
-  if (!ghResp.ok) {
-    throw new Error(
-      ghJson?.message || ghJson?.error || `GraphHopper error (status ${ghResp.status})`
-    );
+  const json: any = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(json?.message || json?.error || `GraphHopper error (status ${resp.status})`);
   }
+  return json;
+}
 
-  const path = ghJson?.paths?.[0];
+/**
+ * Point-to-point routing — GH finds the best path through all waypoints in order.
+ * Used for out-and-back and park loop.
+ */
+async function graphHopperRoute(points: LatLon[], key: string, profile: string) {
+  // GH POST body expects [lon, lat] — normalize then swap
+  const safePoints = points.map((p, i) => {
+    const [lat, lon] = normalizeLatLon(p, `point ${i}`);
+    return [lon, lat];
+  });
+  const json = await ghPost(key, {
+    points: safePoints,
+    profile,
+    points_encoded: false,
+    instructions: false,
+    calc_points: true,
+    elevation: true,
+  });
+  const path = json?.paths?.[0];
   const coords: any[] = path?.points?.coordinates ?? [];
   if (!coords.length) {
-    console.error("GH response missing coordinates:", JSON.stringify(ghJson).slice(0, 500));
+    console.error("GH point-to-point: no coords:", JSON.stringify(json).slice(0, 300));
     throw new Error("GraphHopper returned no coordinates");
   }
-
   return { path, coords };
 }
 
-// ── per-route feature builder ─────────────────────────────────────────────────
-
 /**
- * Attempts a real GH route. If GH fails for any reason, silently falls back
- * to the provided mock geometry. Each of the 3 routes calls this independently
- * so one failure doesn't take down the others.
+ * Round-trip routing — GH generates a loop from a single point, actively
+ * avoiding reuse of the same roads. This is the correct algorithm for
+ * Standard Loop ("take me out and bring me back a different way").
+ *
+ * seed controls which of many possible loops is returned — incrementing it
+ * on each Generate click produces a fresh route each time.
  */
-async function buildRouteFeature({
-  waypoints,
-  mockCoords,
-  targetMeters,
-  pref,
-  ghKey,
-  ghProfile,
-  elevIntensity,
-}: {
-  waypoints: LatLon[];
-  mockCoords: LonLat[];
-  targetMeters: number;
-  pref: "flat" | "hills";
-  ghKey: string | undefined;
-  ghProfile: string;
-  elevIntensity: number;
-}): Promise<object> {
-  if (ghKey) {
-    try {
-      const { path, coords } = await graphHopperRoute(waypoints, ghKey, ghProfile);
-      // (rate-limit errors throw before reaching here)
-      const coordsLonLat: LonLat[] = coords.map((c: any) => [c[0], c[1]]);
-
-      const altitudes = coords
-        .map((c: any) => c?.[2])
-        .filter((n: any) => typeof n === "number");
-
-      let elevProfile: { distanceMeters: number; elevation: number }[];
-      if (altitudes.length > 2) {
-        const total = typeof path?.distance === "number" ? path.distance : targetMeters;
-        const step = total / (altitudes.length - 1);
-        elevProfile = altitudes.map((e: number, i: number) => ({
-          distanceMeters: i * step,
-          elevation: Math.round(e),
-        }));
-      } else {
-        elevProfile = fakeElevationProfile(targetMeters, pref, elevIntensity);
-      }
-
-      const ascent = computeAscent(elevProfile);
-      const distanceMeters =
-        typeof path?.distance === "number" ? path.distance : targetMeters;
-      const distanceMiles = distanceMeters / 1609.34;
-      const timeMinutes =
-        typeof path?.time === "number"
-          ? Math.round(path.time / 1000 / 60)
-          : Math.round(distanceMiles * 10);
-
-      return {
-        type: "Feature",
-        geometry: { type: "LineString", coordinates: coordsLonLat },
-        properties: {
-          metrics: {
-            distanceMiles: Number(distanceMiles.toFixed(2)),
-            timeMinutes,
-            totalAscent: ascent,
-            totalDescent: ascent,
-          },
-          scoring: { overallScore: scoreRoute(ascent, pref) },
-          warnings: [],
-          elevationProfile: elevProfile,
-          source: "graphhopper",
-        },
-      };
-    } catch (e: any) {
-      const msg: string = e?.message ?? String(e);
-      const isRateLimit = msg.toLowerCase().includes("limit");
-      console.warn("GH route failed, using mock fallback:", msg);
-      // Bubble rate-limit errors up with a clear flag so the caller can
-      // surface a useful warning instead of silently showing a mock.
-      if (isRateLimit) {
-        return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
-          "GraphHopper rate limit reached — showing estimated route. Wait a minute and try again.",
-        ]);
-      }
-    }
+async function ghRoundTrip(
+  lat: number,
+  lon: number,
+  distanceMeters: number,
+  seed: number,
+  key: string,
+  profile: string
+) {
+  const json = await ghPost(key, {
+    points: [[lon, lat]], // single point for round trip
+    algorithm: "round_trip",
+    "round_trip.distance": Math.round(distanceMeters),
+    "round_trip.seed": seed,
+    profile,
+    points_encoded: false,
+    instructions: false,
+    calc_points: true,
+    elevation: true,
+  });
+  const path = json?.paths?.[0];
+  const coords: any[] = path?.points?.coordinates ?? [];
+  if (!coords.length) {
+    console.error("GH round_trip: no coords:", JSON.stringify(json).slice(0, 300));
+    throw new Error("GraphHopper round_trip returned no coordinates");
   }
-
-  return buildMockFeature(
-    mockCoords,
-    targetMeters,
-    pref,
-    elevIntensity,
-    [ghKey ? "Route used mock (GraphHopper failed)." : "Using mock (no GH key)."]
-  );
+  return { path, coords };
 }
 
+/**
+ * Overpass API — find the nearest park/open space within radiusMeters.
+ * Returns { lat, lon, name } of the closest one, or null.
+ */
+async function findNearestPark(
+  lat: number,
+  lon: number,
+  radiusMeters = 3000
+): Promise<{ lat: number; lon: number; name?: string } | null> {
+  const query =
+    `[out:json][timeout:8];` +
+    `(way["leisure"="park"](around:${radiusMeters},${lat},${lon});` +
+    `relation["leisure"="park"](around:${radiusMeters},${lat},${lon}););` +
+    `out center 10;`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!resp.ok) return null;
+  const json: any = await resp.json().catch(() => null);
+  if (!json?.elements?.length) return null;
+
+  // Pick whichever element is closest to start
+  let closest: { lat: number; lon: number; name?: string } | null = null;
+  let minDist = Infinity;
+  for (const el of json.elements) {
+    const elLat: number = el.center?.lat ?? el.lat;
+    const elLon: number = el.center?.lon ?? el.lon;
+    if (elLat == null || elLon == null) continue;
+    const dist = Math.sqrt(
+      Math.pow((elLat - lat) * 110540, 2) +
+      Math.pow((elLon - lon) * 111320 * Math.cos((lat * Math.PI) / 180), 2)
+    );
+    if (dist < minDist) {
+      minDist = dist;
+      closest = { lat: elLat, lon: elLon, name: el.tags?.name };
+    }
+  }
+  return closest;
+}
+
+// ── feature builders ──────────────────────────────────────────────────────────
+
 function buildMockFeature(
-  mockCoords: LonLat[],
+  coords: LonLat[],
   targetMeters: number,
   pref: "flat" | "hills",
   elevIntensity: number,
@@ -315,7 +305,7 @@ function buildMockFeature(
   const asc = computeAscent(elev);
   return {
     type: "Feature",
-    geometry: { type: "LineString", coordinates: mockCoords },
+    geometry: { type: "LineString", coordinates: coords },
     properties: {
       metrics: {
         distanceMiles: Number((targetMeters / 1609.34).toFixed(2)),
@@ -331,6 +321,132 @@ function buildMockFeature(
   };
 }
 
+/** Convert a raw GH path+coords response into a GeoJSON Feature with metrics. */
+function parseGHFeature(
+  path: any,
+  coords: any[],
+  targetMeters: number,
+  pref: "flat" | "hills",
+  elevIntensity: number
+): object {
+  const coordsLonLat: LonLat[] = coords.map((c: any) => [c[0], c[1]]);
+  const altitudes = coords
+    .map((c: any) => c?.[2])
+    .filter((n: any) => typeof n === "number");
+
+  let elevProfile: { distanceMeters: number; elevation: number }[];
+  if (altitudes.length > 2) {
+    const total = typeof path?.distance === "number" ? path.distance : targetMeters;
+    const step = total / (altitudes.length - 1);
+    elevProfile = altitudes.map((e: number, i: number) => ({
+      distanceMeters: i * step,
+      elevation: Math.round(e),
+    }));
+  } else {
+    elevProfile = fakeElevationProfile(targetMeters, pref, elevIntensity);
+  }
+
+  const ascent = computeAscent(elevProfile);
+  const distanceMeters = typeof path?.distance === "number" ? path.distance : targetMeters;
+  const distanceMiles = distanceMeters / 1609.34;
+  const timeMinutes =
+    typeof path?.time === "number"
+      ? Math.round(path.time / 1000 / 60)
+      : Math.round(distanceMiles * 10);
+
+  return {
+    type: "Feature",
+    geometry: { type: "LineString", coordinates: coordsLonLat },
+    properties: {
+      metrics: {
+        distanceMiles: Number(distanceMiles.toFixed(2)),
+        timeMinutes,
+        totalAscent: ascent,
+        totalDescent: ascent,
+      },
+      scoring: { overallScore: scoreRoute(ascent, pref) },
+      warnings: [],
+      elevationProfile: elevProfile,
+      source: "graphhopper",
+    },
+  };
+}
+
+function rateWarning(msg: string): boolean {
+  return msg.toLowerCase().includes("limit");
+}
+
+/**
+ * Point-to-point feature: routes through a list of waypoints.
+ * Used for out-and-back and park loop.
+ */
+async function buildPointToPointFeature({
+  waypoints, mockCoords, targetMeters, pref, ghKey, ghProfile, elevIntensity,
+}: {
+  waypoints: LatLon[];
+  mockCoords: LonLat[];
+  targetMeters: number;
+  pref: "flat" | "hills";
+  ghKey: string | undefined;
+  ghProfile: string;
+  elevIntensity: number;
+}): Promise<object> {
+  if (ghKey) {
+    try {
+      const { path, coords } = await graphHopperRoute(waypoints, ghKey, ghProfile);
+      return parseGHFeature(path, coords, targetMeters, pref, elevIntensity);
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      console.warn("GH point-to-point failed:", msg);
+      if (rateWarning(msg)) {
+        return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
+          "GraphHopper rate limit reached — showing estimated route. Wait a minute and try again.",
+        ]);
+      }
+    }
+  }
+  return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
+    ghKey ? "Route used mock (GraphHopper failed)." : "Using mock (no GH key).",
+  ]);
+}
+
+/**
+ * Round-trip feature: uses GH's round_trip algorithm.
+ * Used for Standard Loop — GH actively avoids reusing roads.
+ * Each unique seed produces a genuinely different loop.
+ */
+async function buildRoundTripFeature({
+  lat, lon, targetMeters, seed, mockCoords, pref, ghKey, ghProfile, elevIntensity,
+}: {
+  lat: number;
+  lon: number;
+  targetMeters: number;
+  seed: number;
+  mockCoords: LonLat[];
+  pref: "flat" | "hills";
+  ghKey: string | undefined;
+  ghProfile: string;
+  elevIntensity: number;
+}): Promise<object> {
+  if (ghKey) {
+    try {
+      const { path, coords } = await ghRoundTrip(lat, lon, targetMeters, seed, ghKey, ghProfile);
+      return parseGHFeature(path, coords, targetMeters, pref, elevIntensity);
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      console.warn("GH round_trip failed:", msg);
+      if (rateWarning(msg)) {
+        return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
+          "GraphHopper rate limit reached — showing estimated route. Wait a minute and try again.",
+        ]);
+      }
+    }
+  }
+  return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
+    ghKey ? "Route used mock (GraphHopper failed)." : "Using mock (no GH key).",
+  ]);
+}
+
 // ── main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -339,7 +455,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "GET") {
     return res.status(200).json({ ok: true, message: "API is alive. Use POST to generate routes." });
   }
-
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Use POST" });
   }
@@ -353,19 +468,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       elevationPref,
       directionSeed,
       surfacePref,
+      loopAtPark,
     } = body;
 
-    if (!startLatLng)
-      return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
+    if (!startLatLng) return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
     if (!targetMeters || typeof targetMeters !== "number")
       return res.status(400).json({ error: "Missing targetMeters (number)" });
 
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
-    const type: "loop" | "out-and-back" =
-      routeType === "out-and-back" ? "out-and-back" : "loop";
+    const type: "loop" | "out-and-back" = routeType === "out-and-back" ? "out-and-back" : "loop";
 
-    // Map surfacePref → GH profile
-    // "trail" → hike (prefers unpaved paths), "road"/"mixed" → foot
+    // "trail" → GH hike profile (prefers unpaved), everything else → foot
     const ghProfile = surfacePref === "trail" ? "hike" : "foot";
 
     const [lat, lon] = normalizeLatLon(startLatLng, "startLatLng");
@@ -376,71 +489,125 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ? [25, 70, 115, 160, 205, 250, 295, 340]
         : [0, 90, 180, 270, 45, 135, 225, 315];
     const seedNum = typeof directionSeed === "number" ? directionSeed : 0;
+    const bearing = candidates[seedNum % candidates.length];
 
-    // Three bearings, each offset by 35° to produce distinct route shapes
-    const bearing1 = candidates[seedNum % candidates.length];
-    const bearing2 = bearing1 + 35;
-    const bearing3 = bearing1 + 70;
+    const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
 
-    // Slight distance variation keeps the three routes from overlapping exactly
+    // Slight distance variation so routes 2/3 aren't identical length to route 1
     const meters1 = targetMeters;
     const meters2 = targetMeters * 0.98;
     const meters3 = targetMeters * 1.02;
 
-    const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
+    // ── Out-and-back ──────────────────────────────────────────────────────────
+    // Distinct bearing per route so the 3 options go in meaningfully different
+    // directions, not just slightly different lengths on the same path.
+    if (type === "out-and-back") {
+      const bearing2 = bearing + 35;
+      const bearing3 = bearing + 70;
 
-    // Run GH requests sequentially with a short pause between each.
-    // Parallel calls (Promise.all) blow through the free-tier per-minute limit
-    // almost instantly — sequential keeps burst rate at 1 req at a time.
-    const GH_STAGGER_MS = 300;
+      const f1 = await buildPointToPointFeature({
+        waypoints: buildOutAndBackWaypoints(lat, lon, meters1, bearing),
+        mockCoords: makeOutAndBack(startLonLat, meters1, bearing),
+        targetMeters: meters1, pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0,
+      });
+      await sleep(GH_STAGGER_MS);
 
-    const feature1 = await buildRouteFeature({
-      waypoints: buildWaypoints(lat, lon, meters1, type, bearing1),
-      mockCoords:
-        type === "out-and-back"
-          ? makeOutAndBack(startLonLat, meters1, bearing1)
-          : makeLoop(startLonLat, meters1, pref),
-      targetMeters: meters1,
-      pref,
-      ghKey: GH_KEY,
-      ghProfile,
-      elevIntensity: 1.0,
+      const f2 = await buildPointToPointFeature({
+        waypoints: buildOutAndBackWaypoints(lat, lon, meters2, bearing2),
+        mockCoords: makeOutAndBack(startLonLat, meters2, bearing2),
+        targetMeters: meters2, pref, ghKey: GH_KEY, ghProfile,
+        elevIntensity: pref === "hills" ? 0.85 : 0.8,
+      });
+      await sleep(GH_STAGGER_MS);
+
+      const f3 = await buildPointToPointFeature({
+        waypoints: buildOutAndBackWaypoints(lat, lon, meters3, bearing3),
+        mockCoords: makeOutAndBack(startLonLat, meters3, bearing3),
+        targetMeters: meters3, pref, ghKey: GH_KEY, ghProfile,
+        elevIntensity: pref === "hills" ? 1.55 : 1.25,
+      });
+
+      return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
+    }
+
+    // ── Park Loop ─────────────────────────────────────────────────────────────
+    // Finds the nearest park via Overpass, then routes:
+    //   start → [3 points inside the park] → start
+    // The 3 inner points form a triangle so GH creates a real loop, not an
+    // out-and-back. Each of the 3 route variants rotates the triangle to
+    // produce a different loop shape. seedNum shifts the rotation per click.
+    if (loopAtPark) {
+      const park = GH_KEY
+        ? await findNearestPark(lat, lon).catch((e) => {
+            console.warn("Overpass park lookup failed:", e?.message);
+            return null;
+          })
+        : null;
+
+      if (park) {
+        console.log(`Park Loop: nearest park at ${park.lat},${park.lon} (${park.name ?? "unnamed"})`);
+
+        // Rotate the inner triangle per seedNum so each Generate gives fresh loops
+        const baseRotation = seedNum * 45;
+
+        const f1 = await buildPointToPointFeature({
+          waypoints: buildParkWaypoints(lat, lon, park.lat, park.lon, baseRotation),
+          mockCoords: makeLoop(startLonLat, meters1, pref),
+          targetMeters: meters1, pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0,
+        });
+        await sleep(GH_STAGGER_MS);
+
+        const f2 = await buildPointToPointFeature({
+          waypoints: buildParkWaypoints(lat, lon, park.lat, park.lon, baseRotation + 60),
+          mockCoords: makeLoop(startLonLat, meters2, pref),
+          targetMeters: meters2, pref, ghKey: GH_KEY, ghProfile,
+          elevIntensity: pref === "hills" ? 0.85 : 0.8,
+        });
+        await sleep(GH_STAGGER_MS);
+
+        const f3 = await buildPointToPointFeature({
+          waypoints: buildParkWaypoints(lat, lon, park.lat, park.lon, baseRotation + 120),
+          mockCoords: makeLoop(startLonLat, meters3, pref),
+          targetMeters: meters3, pref, ghKey: GH_KEY, ghProfile,
+          elevIntensity: pref === "hills" ? 1.55 : 1.25,
+        });
+
+        return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
+      }
+
+      // No park found nearby — fall through to Standard Loop
+      console.warn("Park Loop: no park found within 3 km, falling back to standard loop");
+    }
+
+    // ── Standard Loop ─────────────────────────────────────────────────────────
+    // Uses GH's round_trip algorithm, which routes a loop from a single point
+    // while actively minimising road reuse. Seeds are multiplied by 3 so that
+    // clicking Generate produces 3 seeds that don't overlap with the previous
+    // click's set (seedNum=1 uses 3/4/5, seedNum=2 uses 6/7/8, etc.).
+    const f1 = await buildRoundTripFeature({
+      lat, lon, targetMeters: meters1, seed: seedNum * 3,
+      mockCoords: makeLoop(startLonLat, meters1, pref),
+      pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0,
     });
-
     await sleep(GH_STAGGER_MS);
 
-    const feature2 = await buildRouteFeature({
-      waypoints: buildWaypoints(lat, lon, meters2, type, bearing2),
-      mockCoords:
-        type === "out-and-back"
-          ? makeOutAndBack(startLonLat, meters2, bearing2)
-          : makeLoop(startLonLat, meters2, pref),
-      targetMeters: meters2,
-      pref,
-      ghKey: GH_KEY,
-      ghProfile,
+    const f2 = await buildRoundTripFeature({
+      lat, lon, targetMeters: meters2, seed: seedNum * 3 + 1,
+      mockCoords: makeLoop(startLonLat, meters2, pref),
+      pref, ghKey: GH_KEY, ghProfile,
       elevIntensity: pref === "hills" ? 0.85 : 0.8,
     });
-
     await sleep(GH_STAGGER_MS);
 
-    const feature3 = await buildRouteFeature({
-      waypoints: buildWaypoints(lat, lon, meters3, type, bearing3),
-      mockCoords:
-        type === "out-and-back"
-          ? makeOutAndBack(startLonLat, meters3, bearing3)
-          : makeLoop(startLonLat, meters3, pref),
-      targetMeters: meters3,
-      pref,
-      ghKey: GH_KEY,
-      ghProfile,
+    const f3 = await buildRoundTripFeature({
+      lat, lon, targetMeters: meters3, seed: seedNum * 3 + 2,
+      mockCoords: makeLoop(startLonLat, meters3, pref),
+      pref, ghKey: GH_KEY, ghProfile,
       elevIntensity: pref === "hills" ? 1.55 : 1.25,
     });
 
-    return res.status(200).json({
-      type: "FeatureCollection",
-      features: [feature1, feature2, feature3],
-    });
+    return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
+
   } catch (e: any) {
     console.error(e);
     return res.status(500).json({ error: e?.message ?? "Server error" });
