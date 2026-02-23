@@ -418,6 +418,7 @@ function buildCombinedFeature(
 async function buildParkLoopFeature({
   lat, lon,
   parkLat, parkLon,
+  parkName,
   targetMeters,
   seed,
   pref,
@@ -429,6 +430,7 @@ async function buildParkLoopFeature({
   lon: number;
   parkLat: number;
   parkLon: number;
+  parkName?: string;
   targetMeters: number;
   seed: number;
   pref: "flat" | "hills";
@@ -437,7 +439,7 @@ async function buildParkLoopFeature({
   elevIntensity: number;
 }): Promise<object> {
   try {
-    // ── leg 1: home → park center (foot keeps routing sane on streets) ──────
+    // ── leg 1: home → park center ─────────────────────────────────────────────
     const { path: toPath, coords: toCoords } = await graphHopperRoute(
       [[lat, lon], [parkLat, parkLon]],
       ghKey,
@@ -446,11 +448,13 @@ async function buildParkLoopFeature({
     const toDistance = typeof toPath?.distance === "number" ? toPath.distance : 0;
     const toTime = typeof toPath?.time === "number" ? toPath.time : 0;
 
-    // ── leg 2: round_trip inside park (hike prefers trails over roads) ───────
+    // ── leg 2: round_trip inside park ─────────────────────────────────────────
+    // Free-tier GH only supports car, bike, foot — not hike.
+    // foot with round_trip still explores paths/tracks within the park.
     await sleep(GH_STAGGER_MS);
     const loopDistance = Math.max(500, targetMeters - toDistance * 2);
     const { path: loopPath, coords: loopCoords } = await ghRoundTrip(
-      parkLat, parkLon, loopDistance, seed, ghKey, "hike"
+      parkLat, parkLon, loopDistance, seed, ghKey, "foot"
     );
     const loopActualDistance =
       typeof loopPath?.distance === "number" ? loopPath.distance : loopDistance;
@@ -459,7 +463,6 @@ async function buildParkLoopFeature({
     // ── stitch coordinates ────────────────────────────────────────────────────
     const toLonLat: LonLat[] = toCoords.map((c: any) => [c[0], c[1]]);
     const loopLonLat: LonLat[] = loopCoords.map((c: any) => [c[0], c[1]]);
-    // Reverse the to-park path for the return leg (same roads, opposite direction)
     const fromLonLat: LonLat[] = [...toLonLat].reverse();
     const allCoords: LonLat[] = [...toLonLat, ...loopLonLat, ...fromLonLat];
 
@@ -475,10 +478,17 @@ async function buildParkLoopFeature({
     const totalDistance = toDistance * 2 + loopActualDistance;
     const totalTime = toTime * 2 + loopTime;
 
-    return buildCombinedFeature(
+    // Build feature then annotate with park-specific metadata
+    const feature = buildCombinedFeature(
       allCoords, totalDistance, totalTime, allAlts,
       targetMeters, pref, elevIntensity
-    );
+    ) as any;
+
+    feature.properties.parkName = parkName ?? null;
+    feature.properties.parkLoopDistanceMiles = Number((loopActualDistance / 1609.34).toFixed(2));
+    feature.properties.transitDistanceMiles = Number(((toDistance * 2) / 1609.34).toFixed(2));
+
+    return feature;
   } catch (e: any) {
     const msg: string = e?.message ?? String(e);
     console.warn("Park loop GH failed:", msg);
@@ -664,7 +674,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // different section of the park's trail network on each variant.
         // Multiplying by 3 + offset keeps seeds non-overlapping across Generate clicks.
         const f1 = await buildParkLoopFeature({
-          lat, lon, parkLat: park.lat, parkLon: park.lon,
+          lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters1, seed: seedNum * 3,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters1, pref),
           elevIntensity: 1.0,
@@ -672,7 +682,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await sleep(GH_STAGGER_MS);
 
         const f2 = await buildParkLoopFeature({
-          lat, lon, parkLat: park.lat, parkLon: park.lon,
+          lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters2, seed: seedNum * 3 + 1,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters2, pref),
           elevIntensity: pref === "hills" ? 0.85 : 0.8,
@@ -680,7 +690,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await sleep(GH_STAGGER_MS);
 
         const f3 = await buildParkLoopFeature({
-          lat, lon, parkLat: park.lat, parkLon: park.lon,
+          lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters3, seed: seedNum * 3 + 2,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters3, pref),
           elevIntensity: pref === "hills" ? 1.55 : 1.25,
