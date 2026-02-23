@@ -83,6 +83,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [routeData, setRouteData] = useState<FeatureCollection | null>(null);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState<number>(0);
+  const [hoveredRouteIndex, setHoveredRouteIndex] = useState<number | null>(null);
   const [routeFadeKey, setRouteFadeKey] = useState(0);
 
   // Load last route from localStorage (on first mount)
@@ -121,14 +122,16 @@ export default function App() {
   }, [routeData, startLatLng, start, selectedRouteIndex]);
 
   // Style helper for “show all routes”
+  // Selected = neon green, hovered (not selected) = dim white preview, others = dark
   const routeStyle = (idx: number) => {
     const isSel = idx === selectedRouteIndex;
+    const isHov = idx === hoveredRouteIndex && !isSel;
     return {
-      color: isSel ? "#ccff00" : "#3f3f46",
-      weight: isSel ? 6 : 3,
-      opacity: isSel ? 0.95 : 0.55,
-      lineCap: "square" as const,
-      lineJoin: "miter" as const,
+      color: isSel ? “#ccff00” : isHov ? “#ffffff” : “#3f3f46”,
+      weight: isSel ? 6 : isHov ? 4 : 3,
+      opacity: isSel ? 0.95 : isHov ? 0.7 : 0.45,
+      lineCap: “square” as const,
+      lineJoin: “miter” as const,
     };
   };
 
@@ -515,10 +518,12 @@ export default function App() {
                       setSelectedRouteIndex(idx);
                       setRouteFadeKey((k) => k + 1);
                     }}
+                    onMouseEnter={() => setHoveredRouteIndex(idx)}
+                    onMouseLeave={() => setHoveredRouteIndex(null)}
                     className={`text-left p-5 border transition-all ${
                       isSelected
                         ? "border-neon bg-neon/5 scale-[1.02]"
-                        : "border-zinc-800 bg-black hover:border-zinc-500 opacity-70 hover:opacity-100"
+                        : "border-zinc-800 bg-black hover:border-zinc-600 opacity-70 hover:opacity-100"
                     }`}
                   >
                     <div className="flex justify-between items-center mb-3">
@@ -625,8 +630,28 @@ export default function App() {
 
             {/* SHOW ALL ROUTES */}
             {routeData?.features?.map((feature: any, idx: number) => (
-              <GeoJSON key={`route-${idx}-${routeFadeKey}`} data={feature} style={routeStyle(idx)} />
+              <GeoJSON key={`route-${idx}-${routeFadeKey}-${hoveredRouteIndex}`} data={feature} style={routeStyle(idx)} />
             ))}
+
+            {/* Park center marker for park loop routes */}
+            {selectedFeature?.properties?.parkLat != null && (
+              <CircleMarker
+                center={[selectedFeature.properties.parkLat, selectedFeature.properties.parkLon]}
+                radius={9}
+                pathOptions={{
+                  color: "#ccff00",
+                  fillColor: "#000000",
+                  fillOpacity: 0.85,
+                  weight: 2,
+                }}
+              >
+                <Popup>
+                  <span style={{ fontFamily: "monospace", fontSize: 11 }}>
+                    {selectedFeature.properties.parkName ?? "Park"}
+                  </span>
+                </Popup>
+              </CircleMarker>
+            )}
 
             {/* Turnaround marker for selected route (out-and-back only) */}
             {selectedFeature && routeType === "out-and-back" && (() => {
