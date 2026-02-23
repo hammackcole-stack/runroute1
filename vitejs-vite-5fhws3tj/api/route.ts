@@ -463,10 +463,10 @@ function buildCombinedFeature(
  * Park Loop feature builder — the correct approach for using real park trails:
  *
  *  1. Route home → park center using `foot` profile (streets/paths)
- *  2. `round_trip` from park center using `hike` profile — GH explores the
- *     actual trail network that exists at that location, returning a loop that
- *     uses real mapped trails rather than geometric waypoints that might land
- *     anywhere.
+ *  2. `round_trip` from park center using `foot` profile — GH explores the
+ *     actual path network at that location (footways, tracks, park paths),
+ *     returning a loop that uses real mapped trails. Repeated N times to fill
+ *     the remaining distance budget (lap count shown on route card).
  *  3. Stitch: toPark + parkLoop + reverse(toPark) → one continuous route
  *
  * The remaining loop distance is computed as targetMeters − 2×toParkDistance
@@ -560,6 +560,8 @@ async function buildParkLoopFeature({
     ) as any;
 
     feature.properties.parkName = parkName ?? null;
+    feature.properties.parkLat = parkLat;
+    feature.properties.parkLon = parkLon;
     feature.properties.parkLaps = laps;
     feature.properties.parkLapDistanceMiles = Number((lapActualDistance / 1609.34).toFixed(2));
     feature.properties.transitDistanceMiles = Number(((toDistance * 2) / 1609.34).toFixed(2));
@@ -679,8 +681,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
     const type: "loop" | "out-and-back" = routeType === "out-and-back" ? "out-and-back" : "loop";
 
-    // "trail" → GH hike profile (prefers unpaved), everything else → foot
-    const ghProfile = surfacePref === "trail" ? "hike" : "foot";
+    // Free-tier GH only supports car, bike, foot — "hike" is paid-only.
+    // foot already routes on park paths, footways, and tracks, so it's the
+    // right choice for trail preference too. The distinction is in how GH
+    // weights surfaces, not which paths it can access.
+    const ghProfile = "foot";
 
     const [lat, lon] = normalizeLatLon(startLatLng, "startLatLng");
     const startLonLat: LonLat = [lon, lat];
@@ -732,11 +737,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── Park Loop ─────────────────────────────────────────────────────────────
-    // Finds the nearest park via Overpass, then routes:
-    //   start → [3 points inside the park] → start
-    // The 3 inner points form a triangle so GH creates a real loop, not an
-    // out-and-back. Each of the 3 route variants rotates the triangle to
-    // produce a different loop shape. seedNum shifts the rotation per click.
+    // Finds the target park via Overpass (by name if provided, else nearest),
+    // then for each of the 3 route variants:
+    //   1. foot routing home → park center
+    //   2. round_trip from park center (N laps based on distance budget)
+    //   3. reverse(leg 1) home
+    // Different seeds give different trail paths per variant.
     if (loopAtPark) {
       const searchName: string | null =
         typeof parkSearch === "string" && parkSearch.trim().length > 0
