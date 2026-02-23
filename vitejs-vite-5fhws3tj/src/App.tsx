@@ -64,6 +64,9 @@ export default function App() {
   const [startLatLng, setStartLatLng] = useState<[number, number] | null>(null);
   const [directionSeed, setDirectionSeed] = useState(0);
 
+  // Park search (optional — used when Park Loop is selected)
+  const [parkSearch, setParkSearch] = useState("");
+
   // Modifiers
   const [mode, setMode] = useState<"distance" | "time">("distance");
   const [targetValue, setTargetValue] = useState<number>(5); // Miles or Minutes
@@ -190,11 +193,10 @@ export default function App() {
           targetMeters,
           elevationPref,
           directionSeed: nextSeed,
-          // new:
           surfacePref,
           avoidMajorRoads,
-          // keeping for later experiments:
           loopAtPark,
+          parkSearch: parkSearch.trim() || null,
           waypoint,
         }),
       });
@@ -310,6 +312,18 @@ export default function App() {
                   >
                     Park Loop
                   </button>
+
+                  {loopAtPark && (
+                    <div className="border border-zinc-800 focus-within:border-neon transition-colors">
+                      <input
+                        type="text"
+                        value={parkSearch}
+                        onChange={(e) => setParkSearch(e.target.value)}
+                        placeholder="Park name (optional)"
+                        className="w-full bg-transparent text-white placeholder-zinc-700 outline-none text-xs font-medium px-3 py-2"
+                      />
+                    </div>
+                  )}
 
                   <button
                     type="button"
@@ -490,7 +504,8 @@ export default function App() {
                 const featMetrics = feature.properties.metrics;
                 const featScoring = feature.properties.scoring;
                 const parkName: string | null = feature.properties.parkName ?? null;
-                const parkLoopMi: number | null = feature.properties.parkLoopDistanceMiles ?? null;
+                const parkLaps: number | null = feature.properties.parkLaps ?? null;
+                const parkLapMi: number | null = feature.properties.parkLapDistanceMiles ?? null;
                 const transitMi: number | null = feature.properties.transitDistanceMiles ?? null;
 
                 return (
@@ -541,13 +556,13 @@ export default function App() {
                       </div>
                     </div>
 
-                    {parkName && parkLoopMi != null && (
+                    {parkName && parkLaps != null && parkLapMi != null && (
                       <div className="mt-3 pt-3 border-t border-zinc-800 space-y-1">
                         <p className="text-[10px] font-bold text-neon uppercase tracking-widest truncate">
                           {parkName}
                         </p>
                         <p className="text-[10px] text-zinc-500 uppercase tracking-widest">
-                          {parkLoopMi} mi trail loop
+                          {parkLaps}× loop · {parkLapMi} mi/lap
                           {transitMi != null && (
                             <span className="text-zinc-700"> · {transitMi} mi transit</span>
                           )}
