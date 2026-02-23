@@ -1,29 +1,38 @@
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  MapContainer,
-  TileLayer,
-  GeoJSON,
-  useMap,
   CircleMarker,
+  GeoJSON,
+  MapContainer,
   Popup,
+  TileLayer,
+  useMap,
 } from "react-leaflet";
 import {
-  AreaChart,
   Area,
-  XAxis,
-  YAxis,
+  AreaChart,
   ResponsiveContainer,
   Tooltip,
+  XAxis,
+  YAxis,
 } from "recharts";
 import {
-  MapPin,
-  Navigation,
-  TrendingUp,
   AlertTriangle,
   Loader2,
+  MapPin,
+  Navigation,
   Play,
+  TrendingUp,
 } from "lucide-react";
 import L from "leaflet";
+
+type FeatureCollection = {
+  type: "FeatureCollection";
+  features: any[];
+};
+
+type SurfacePref = "mixed" | "trail" | "road";
+
+const LS_KEY = "runroute:lastRoute:v1";
 
 // Helper component to adjust map view when route changes
 function MapUpdater({ geoJsonData }: { geoJsonData: any }) {
@@ -32,30 +41,20 @@ function MapUpdater({ geoJsonData }: { geoJsonData: any }) {
     if (geoJsonData) {
       const bounds = L.geoJSON(geoJsonData).getBounds();
       if (bounds.isValid()) {
-        map.fitBounds(bounds, {
-          padding: [50, 50],
-          animate: true,
-          duration: 0.6,
-        });
+        map.fitBounds(bounds, { padding: [50, 50], animate: true, duration: 0.6 });
       }
     }
   }, [geoJsonData, map]);
   return null;
 }
 
-function StartUpdater({
-  startLatLng,
-}: {
-  startLatLng: [number, number] | null;
-}) {
+function StartUpdater({ startLatLng }: { startLatLng: [number, number] | null }) {
   const map = useMap();
   useEffect(() => {
     if (startLatLng) map.setView(startLatLng, 15);
   }, [startLatLng, map]);
   return null;
 }
-
-type ElevPoint = { distanceMeters: number; elevation: number };
 
 export default function App() {
   // Core inputs
@@ -72,12 +71,51 @@ export default function App() {
   const [loopAtPark, setLoopAtPark] = useState(false);
   const [elevationPref, setElevationPref] = useState<"flat" | "hills">("flat");
 
+  // NEW: surface + avoid majors
+  const [surfacePref, setSurfacePref] = useState<SurfacePref>("mixed");
+  const [avoidMajorRoads, setAvoidMajorRoads] = useState<boolean>(true);
+
   // Request state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [routeData, setRouteData] = useState<any>(null);
+  const [routeData, setRouteData] = useState<FeatureCollection | null>(null);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState<number>(0);
   const [routeFadeKey, setRouteFadeKey] = useState(0);
+
+  // Load last route from localStorage (on first mount)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed?.routeData?.features?.length) {
+        setRouteData(parsed.routeData);
+        if (Array.isArray(parsed.startLatLng)) setStartLatLng(parsed.startLatLng);
+        if (typeof parsed.start === "string") setStart(parsed.start);
+        if (typeof parsed.selectedRouteIndex === "number") setSelectedRouteIndex(parsed.selectedRouteIndex);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Persist last route whenever it changes
+  useEffect(() => {
+    try {
+      if (!routeData?.features?.length) return;
+      localStorage.setItem(
+        LS_KEY,
+        JSON.stringify({
+          routeData,
+          startLatLng,
+          start,
+          selectedRouteIndex,
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, [routeData, startLatLng, start, selectedRouteIndex]);
 
   // Style helper for “show all routes”
   const routeStyle = (idx: number) => {
@@ -91,10 +129,18 @@ export default function App() {
     };
   };
 
+  const selectedFeature = useMemo(() => {
+    return routeData?.features?.[selectedRouteIndex] ?? routeData?.features?.[0] ?? null;
+  }, [routeData, selectedRouteIndex]);
+
+  const properties = selectedFeature?.properties ?? null;
+  const warnings: string[] = (properties?.warnings as string[]) ?? [];
+  const elevationProfile =
+    (properties?.elevationProfile as { distanceMeters: number; elevation: number }[]) ?? [];
+
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // compute next seed locally so we can send it to /api/route
     const nextSeed = directionSeed + 1;
     setDirectionSeed(nextSeed);
 
@@ -103,32 +149,28 @@ export default function App() {
     setRouteData(null);
     setSelectedRouteIndex(0);
 
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 30000);
+
     try {
-      // 1) Geocode start -> startLatLngResolved (always [lat, lng])
-      let startLatLngResolved: [number, number] = [34.0224, -118.2923]; // fallback LA [lat,lng]
+      // 1) Geocode (Nominatim). fallback to LA.
+      let startCoordsLonLat: [number, number] = [-118.2923, 34.0224]; // [lon, lat]
 
       try {
         const nomUrl =
           `https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=0` +
           `&q=${encodeURIComponent(start)}` +
           `&email=demo@example.com`;
-
         const res = await fetch(nomUrl);
         const json: any[] = await res.json();
-
         if (json?.length) {
-          const lat = parseFloat(json[0].lat);
-          const lon = parseFloat(json[0].lon);
-          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
-            startLatLngResolved = [lat, lon];
-          }
+          startCoordsLonLat = [parseFloat(json[0].lon), parseFloat(json[0].lat)];
+          setStartLatLng([parseFloat(json[0].lat), parseFloat(json[0].lon)]); // [lat, lon]
         }
       } catch {
         // ignore; use fallback
+        setStartLatLng([startCoordsLonLat[1], startCoordsLonLat[0]]);
       }
-
-      // IMPORTANT: always set startLatLng so the map + marker update even on fallback
-      setStartLatLng(startLatLngResolved);
 
       // 2) Determine target distance in meters
       const targetMiles =
@@ -137,50 +179,52 @@ export default function App() {
           : Math.max(0.5, targetValue / Math.max(1, pace));
       const targetMeters = targetMiles * 1609.34;
 
-      // 3) Call /api/route (server calls GraphHopper / fallback)
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 30000); // 30s
-
+      // 3) Call Vercel function
       const resp = await fetch("/api/route", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          startLatLng: startLatLngResolved, // [lat,lng]
+          startLatLng: [startCoordsLonLat[1], startCoordsLonLat[0]], // [lat,lon]
           routeType,
           targetMeters,
           elevationPref,
           directionSeed: nextSeed,
-          loopAtPark, // optional (server can ignore)
+          // new:
+          surfacePref,
+          avoidMajorRoads,
+          // keeping for later experiments:
+          loopAtPark,
+          waypoint,
         }),
-      }).finally(() => window.clearTimeout(timeout));
+      });
 
-      const json = await resp.json();
+      const json = await resp.json().catch(() => null);
+
       if (!resp.ok) {
-        throw new Error(json?.error || "Route request failed");
+        throw new Error(json?.error || `Route request failed (${resp.status})`);
+      }
+
+      if (!json?.features?.length) {
+        throw new Error(
+          json?.error ||
+            "No routes returned. Check GH_KEY in Vercel, or GraphHopper limits."
+        );
       }
 
       setRouteData(json);
     } catch (err: any) {
+      const msg =
+        err?.name === "AbortError"
+          ? "Route request timed out (30s). Try again."
+          : err?.message || "Something went wrong.";
       console.error(err);
-      if (err?.name === "AbortError") {
-        setError("Route request timed out (30s). Try again.");
-      } else {
-        setError(err?.message || "Something went wrong.");
-      }
+      setError(msg);
     } finally {
+      clearTimeout(t);
       setLoading(false);
     }
   };
-
-  // Selected feature + derived props
-  const selectedFeature =
-    routeData?.features?.[selectedRouteIndex] ?? routeData?.features?.[0] ?? null;
-
-  const properties = selectedFeature?.properties ?? null;
-  const warnings: string[] = (properties?.warnings as string[]) ?? [];
-  const elevationProfile: ElevPoint[] =
-    (properties?.elevationProfile as ElevPoint[]) ?? [];
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full bg-black text-white overflow-hidden font-sans">
@@ -220,10 +264,9 @@ export default function App() {
                     <Navigation className="w-4 h-4 text-neon mr-3 shrink-0" />
                     <input
                       type="text"
-                      required={false}
                       value={waypoint}
                       onChange={(e) => setWaypoint(e.target.value)}
-                      placeholder="Enter turnaround point"
+                      placeholder="(Optional) Enter turnaround point"
                       className="w-full bg-transparent text-white placeholder-zinc-700 outline-none text-lg font-medium"
                     />
                   </div>
@@ -317,6 +360,46 @@ export default function App() {
               </div>
             </div>
 
+            {/* NEW: SURFACE + AVOID */}
+            <div className="pt-2">
+              <label className="block text-[10px] font-bold text-zinc-600 uppercase tracking-[0.2em] mb-2">
+                Surface
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                {(["mixed", "trail", "road"] as SurfacePref[]).map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => setSurfacePref(opt)}
+                    className={`p-3 text-xs font-bold uppercase tracking-widest border transition-all ${
+                      surfacePref === opt
+                        ? "border-neon text-neon bg-neon/10"
+                        : "border-zinc-800 text-zinc-500 hover:border-zinc-600"
+                    }`}
+                  >
+                    {opt === "mixed" ? "Mixed" : opt === "trail" ? "Trails" : "Roads"}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mt-3 flex items-center justify-between border border-zinc-800 p-3">
+                <span className="text-xs font-bold uppercase tracking-widest text-zinc-500">
+                  Avoid Major Roads
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setAvoidMajorRoads((v) => !v)}
+                  className={`px-3 py-2 text-xs font-black uppercase tracking-widest border transition-all ${
+                    avoidMajorRoads
+                      ? "border-neon text-neon bg-neon/10"
+                      : "border-zinc-700 text-zinc-500"
+                  }`}
+                >
+                  {avoidMajorRoads ? "On" : "Off"}
+                </button>
+              </div>
+            </div>
+
             {/* METRICS */}
             <div className="pt-2">
               <div className="flex gap-4 mb-4">
@@ -324,9 +407,7 @@ export default function App() {
                   type="button"
                   onClick={() => setMode("distance")}
                   className={`text-[10px] font-bold uppercase tracking-[0.2em] transition-colors ${
-                    mode === "distance"
-                      ? "text-neon"
-                      : "text-zinc-600 hover:text-white"
+                    mode === "distance" ? "text-neon" : "text-zinc-600 hover:text-white"
                   }`}
                 >
                   By Distance
@@ -398,7 +479,7 @@ export default function App() {
             </div>
           )}
 
-          {routeData?.features && (
+          {routeData?.features?.length ? (
             <div className="mt-10 flex flex-col gap-4 pb-8">
               <h2 className="text-[10px] font-bold text-zinc-600 uppercase tracking-[0.2em]">
                 Available Routes
@@ -406,12 +487,12 @@ export default function App() {
 
               {routeData.features.map((feature: any, idx: number) => {
                 const isSelected = selectedRouteIndex === idx;
-                const featMetrics = feature?.properties?.metrics ?? {};
-                const featScoring = feature?.properties?.scoring ?? {};
+                const featMetrics = feature.properties.metrics;
+                const featScoring = feature.properties.scoring;
 
                 return (
                   <button
-                    key={idx}
+                    key={`${idx}-${routeFadeKey}`}
                     onClick={() => {
                       setSelectedRouteIndex(idx);
                       setRouteFadeKey((k) => k + 1);
@@ -427,46 +508,32 @@ export default function App() {
                         Route 0{idx + 1}
                       </span>
                       <span className="text-[10px] font-bold text-white tracking-[0.2em] px-2 py-1 border border-zinc-700">
-                        {featScoring?.overallScore ?? "--"} MATCH
+                        {featScoring.overallScore} MATCH
                       </span>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2">
                       <div>
-                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">
-                          Dist
-                        </p>
+                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">Dist</p>
                         <p className="text-xl font-black">
-                          {featMetrics?.distanceMiles ?? "--"}
-                          <span className="text-xs text-zinc-500 font-normal ml-1">
-                            mi
-                          </span>
+                          {featMetrics.distanceMiles}
+                          <span className="text-xs text-zinc-500 font-normal ml-1">mi</span>
                         </p>
                       </div>
 
                       <div>
-                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">
-                          Est
-                        </p>
+                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">Est</p>
                         <p className="text-xl font-black">
-                          {featMetrics?.timeMinutes ?? "--"}
-                          <span className="text-xs text-zinc-500 font-normal ml-1">
-                            m
-                          </span>
+                          {featMetrics.timeMinutes}
+                          <span className="text-xs text-zinc-500 font-normal ml-1">m</span>
                         </p>
                       </div>
 
                       <div>
-                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">
-                          Climb
-                        </p>
+                        <p className="text-[10px] text-zinc-600 uppercase tracking-widest mb-1">Climb</p>
                         <p className="text-xl font-black">
-                          {featMetrics?.totalAscent != null
-                            ? Math.round(featMetrics.totalAscent)
-                            : "--"}
-                          <span className="text-xs text-zinc-500 font-normal ml-1">
-                            m
-                          </span>
+                          {Math.round(featMetrics.totalAscent)}
+                          <span className="text-xs text-zinc-500 font-normal ml-1">m</span>
                         </p>
                       </div>
                     </div>
@@ -474,7 +541,7 @@ export default function App() {
                 );
               })}
             </div>
-          )}
+          ) : null}
         </div>
       </aside>
 
@@ -526,34 +593,28 @@ export default function App() {
 
             {/* SHOW ALL ROUTES */}
             {routeData?.features?.map((feature: any, idx: number) => (
-              <GeoJSON
-                key={`route-${idx}-${routeFadeKey}`}
-                data={feature}
-                style={routeStyle(idx)}
-              />
+              <GeoJSON key={`route-${idx}-${routeFadeKey}`} data={feature} style={routeStyle(idx)} />
             ))}
 
             {/* Turnaround marker for selected route (out-and-back only) */}
-            {selectedFeature &&
-              routeType === "out-and-back" &&
-              (() => {
-                const coords = selectedFeature.geometry.coordinates;
-                const turn = coords[Math.floor(coords.length / 2)];
-                const latlng: [number, number] = [turn[1], turn[0]];
-                return (
-                  <CircleMarker
-                    center={latlng}
-                    radius={8}
-                    pathOptions={{
-                      color: "#39FF14",
-                      fillColor: "#39FF14",
-                      fillOpacity: 1,
-                    }}
-                  >
-                    <Popup>Turn around here</Popup>
-                  </CircleMarker>
-                );
-              })()}
+            {selectedFeature && routeType === "out-and-back" && (() => {
+              const coords = selectedFeature.geometry.coordinates;
+              const turn = coords[Math.floor(coords.length / 2)];
+              const latlng: [number, number] = [turn[1], turn[0]];
+              return (
+                <CircleMarker
+                  center={latlng}
+                  radius={8}
+                  pathOptions={{
+                    color: "#39FF14",
+                    fillColor: "#39FF14",
+                    fillOpacity: 1,
+                  }}
+                >
+                  <Popup>Turn around here</Popup>
+                </CircleMarker>
+              );
+            })()}
 
             {selectedFeature && <MapUpdater geoJsonData={selectedFeature} />}
           </MapContainer>
@@ -577,13 +638,7 @@ export default function App() {
                   margin={{ top: 5, right: 0, left: -20, bottom: 0 }}
                 >
                   <defs>
-                    <linearGradient
-                      id="colorElevation"
-                      x1="0"
-                      y1="0"
-                      x2="0"
-                      y2="1"
-                    >
+                    <linearGradient id="colorElevation" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#ccff00" stopOpacity={0.4} />
                       <stop offset="100%" stopColor="#ccff00" stopOpacity={0} />
                     </linearGradient>
@@ -593,21 +648,13 @@ export default function App() {
                     dataKey="distanceMeters"
                     tickFormatter={(val) => `${(val / 1609.34).toFixed(1)}`}
                     stroke="#27272a"
-                    tick={{
-                      fontSize: 10,
-                      fill: "#52525b",
-                      fontFamily: "monospace",
-                    }}
+                    tick={{ fontSize: 10, fill: "#52525b", fontFamily: "monospace" }}
                     axisLine={false}
                     tickLine={false}
                   />
                   <YAxis
                     stroke="#27272a"
-                    tick={{
-                      fontSize: 10,
-                      fill: "#52525b",
-                      fontFamily: "monospace",
-                    }}
+                    tick={{ fontSize: 10, fill: "#52525b", fontFamily: "monospace" }}
                     domain={["dataMin - 5", "dataMax + 5"]}
                     axisLine={false}
                     tickLine={false}
@@ -626,9 +673,7 @@ export default function App() {
                       textTransform: "uppercase",
                       letterSpacing: "0.1em",
                     }}
-                    labelFormatter={(val: number) =>
-                      `DIST ${(val / 1609.34).toFixed(2)} MI`
-                    }
+                    labelFormatter={(val: number) => `DIST ${(val / 1609.34).toFixed(2)} MI`}
                   />
                   <Area
                     type="step"
