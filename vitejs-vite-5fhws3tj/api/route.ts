@@ -7,6 +7,8 @@ type LonLat = [number, number]; // [lon, lat] — GeoJSON format
 const GH_TIMEOUT_MS = 8_000;
 const OVERPASS_TIMEOUT_MS = 8_000;
 const GH_STAGGER_MS = 300;
+// Target distance for one park lap — used to compute how many laps fit in budget
+const PARK_LAP_TARGET_METERS = 1609; // ~1 mile
 
 // ── coordinate helpers ────────────────────────────────────────────────────────
 
@@ -266,6 +268,64 @@ async function findNearestPark(
   return closest;
 }
 
+/**
+ * Overpass API — find a specific park by name near the user's location.
+ * Uses case-insensitive regex matching so "griffith" matches "Griffith Park".
+ * Searches within radiusMeters (default 15 km, wider than nearest-park since
+ * the user might be running to a named park that isn't the closest one).
+ * Falls back to null if nothing matches.
+ */
+async function findParkByName(
+  name: string,
+  lat: number,
+  lon: number,
+  radiusMeters = 15000
+): Promise<{ lat: number; lon: number; name?: string } | null> {
+  // Escape regex special chars so the name is treated as a literal substring
+  const escaped = name.replace(/[[\](){}*+?.\\^$|]/g, "\\$&");
+  const query =
+    `[out:json][timeout:10];` +
+    `(way["leisure"="park"]["name"~"${escaped}",i](around:${radiusMeters},${lat},${lon});` +
+    `relation["leisure"="park"]["name"~"${escaped}",i](around:${radiusMeters},${lat},${lon}););` +
+    `out center 5;`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!resp.ok) return null;
+  const json: any = await resp.json().catch(() => null);
+  if (!json?.elements?.length) return null;
+
+  // Pick the closest match to the start point
+  let closest: { lat: number; lon: number; name?: string } | null = null;
+  let minDist = Infinity;
+  for (const el of json.elements) {
+    const elLat: number = el.center?.lat ?? el.lat;
+    const elLon: number = el.center?.lon ?? el.lon;
+    if (elLat == null || elLon == null) continue;
+    const dist = Math.sqrt(
+      Math.pow((elLat - lat) * 110540, 2) +
+      Math.pow((elLon - lon) * 111320 * Math.cos((lat * Math.PI) / 180), 2)
+    );
+    if (dist < minDist) {
+      minDist = dist;
+      closest = { lat: elLat, lon: elLon, name: el.tags?.name };
+    }
+  }
+  return closest;
+}
+
 // ── feature builders ──────────────────────────────────────────────────────────
 
 function buildMockFeature(
@@ -425,6 +485,7 @@ async function buildParkLoopFeature({
   ghKey,
   mockCoords,
   elevIntensity,
+  extraWarning,
 }: {
   lat: number;
   lon: number;
@@ -437,6 +498,7 @@ async function buildParkLoopFeature({
   ghKey: string;
   mockCoords: LonLat[];
   elevIntensity: number;
+  extraWarning?: string | null;
 }): Promise<object> {
   try {
     // ── leg 1: home → park center ─────────────────────────────────────────────
@@ -448,31 +510,44 @@ async function buildParkLoopFeature({
     const toDistance = typeof toPath?.distance === "number" ? toPath.distance : 0;
     const toTime = typeof toPath?.time === "number" ? toPath.time : 0;
 
-    // ── leg 2: round_trip inside park ─────────────────────────────────────────
-    // Free-tier GH only supports car, bike, foot — not hike.
-    // foot with round_trip still explores paths/tracks within the park.
+    // ── leg 2: one lap of park round_trip, repeated N times ──────────────────
+    // Free-tier GH supports foot (not hike). foot round_trip still uses park
+    // paths/tracks. We compute a natural lap size (~1 mile) and repeat it to
+    // fill the park distance budget — this lets the route card show "3× loop".
     await sleep(GH_STAGGER_MS);
-    const loopDistance = Math.max(500, targetMeters - toDistance * 2);
-    const { path: loopPath, coords: loopCoords } = await ghRoundTrip(
-      parkLat, parkLon, loopDistance, seed, ghKey, "foot"
+    const loopBudget = Math.max(500, targetMeters - toDistance * 2);
+    const laps = Math.max(1, Math.round(loopBudget / PARK_LAP_TARGET_METERS));
+    const lapMeters = loopBudget / laps;
+
+    const { path: loopPath, coords: lapCoords } = await ghRoundTrip(
+      parkLat, parkLon, lapMeters, seed, ghKey, "foot"
     );
-    const loopActualDistance =
-      typeof loopPath?.distance === "number" ? loopPath.distance : loopDistance;
-    const loopTime = typeof loopPath?.time === "number" ? loopPath.time : 0;
+    const lapActualDistance =
+      typeof loopPath?.distance === "number" ? loopPath.distance : lapMeters;
+    const lapTime = typeof loopPath?.time === "number" ? loopPath.time : 0;
+
+    // Repeat the single lap N times to build the multi-lap park segment
+    const lapLonLat: LonLat[] = lapCoords.map((c: any) => [c[0], c[1]]);
+    const loopLonLat: LonLat[] = [];
+    for (let i = 0; i < laps; i++) loopLonLat.push(...lapLonLat);
+
+    const loopActualDistance = lapActualDistance * laps;
+    const loopTime = lapTime * laps;
 
     // ── stitch coordinates ────────────────────────────────────────────────────
     const toLonLat: LonLat[] = toCoords.map((c: any) => [c[0], c[1]]);
-    const loopLonLat: LonLat[] = loopCoords.map((c: any) => [c[0], c[1]]);
     const fromLonLat: LonLat[] = [...toLonLat].reverse();
     const allCoords: LonLat[] = [...toLonLat, ...loopLonLat, ...fromLonLat];
 
-    // ── stitch altitudes ──────────────────────────────────────────────────────
+    // ── stitch altitudes (repeat for each lap) ────────────────────────────────
     const toAlts = toCoords
       .map((c: any) => c?.[2])
       .filter((n: any) => typeof n === "number") as number[];
-    const loopAlts = loopCoords
+    const lapAlts = lapCoords
       .map((c: any) => c?.[2])
       .filter((n: any) => typeof n === "number") as number[];
+    const loopAlts: number[] = [];
+    for (let i = 0; i < laps; i++) loopAlts.push(...lapAlts);
     const allAlts = [...toAlts, ...loopAlts, ...[...toAlts].reverse()];
 
     const totalDistance = toDistance * 2 + loopActualDistance;
@@ -485,8 +560,10 @@ async function buildParkLoopFeature({
     ) as any;
 
     feature.properties.parkName = parkName ?? null;
-    feature.properties.parkLoopDistanceMiles = Number((loopActualDistance / 1609.34).toFixed(2));
+    feature.properties.parkLaps = laps;
+    feature.properties.parkLapDistanceMiles = Number((lapActualDistance / 1609.34).toFixed(2));
     feature.properties.transitDistanceMiles = Number(((toDistance * 2) / 1609.34).toFixed(2));
+    if (extraWarning) feature.properties.warnings = [extraWarning, ...(feature.properties.warnings ?? [])];
 
     return feature;
   } catch (e: any) {
@@ -592,6 +669,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       directionSeed,
       surfacePref,
       loopAtPark,
+      parkSearch, // optional park name typed by the user
     } = body;
 
     if (!startLatLng) return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
@@ -660,15 +738,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // out-and-back. Each of the 3 route variants rotates the triangle to
     // produce a different loop shape. seedNum shifts the rotation per click.
     if (loopAtPark) {
-      const park = GH_KEY
-        ? await findNearestPark(lat, lon).catch((e) => {
+      const searchName: string | null =
+        typeof parkSearch === "string" && parkSearch.trim().length > 0
+          ? parkSearch.trim()
+          : null;
+
+      let park: { lat: number; lon: number; name?: string } | null = null;
+      let parkWarning: string | null = null;
+
+      if (GH_KEY) {
+        if (searchName) {
+          // User named a specific park — search by name first
+          park = await findParkByName(searchName, lat, lon).catch((e) => {
+            console.warn("Overpass named park lookup failed:", e?.message);
+            return null;
+          });
+          if (!park) {
+            // Named park not found — fall back to nearest and warn
+            console.warn(`Park "${searchName}" not found, falling back to nearest`);
+            parkWarning = `Couldn't find "${searchName}" nearby — routing to the nearest park instead.`;
+            park = await findNearestPark(lat, lon).catch(() => null);
+          }
+        } else {
+          park = await findNearestPark(lat, lon).catch((e) => {
             console.warn("Overpass park lookup failed:", e?.message);
             return null;
-          })
-        : null;
+          });
+        }
+      }
 
       if (park) {
-        console.log(`Park Loop: nearest park "${park.name ?? "unnamed"}" at ${park.lat},${park.lon}`);
+        console.log(`Park Loop: using "${park.name ?? "unnamed"}" at ${park.lat},${park.lon}`);
 
         // Each route uses a different seed so GH's round_trip explores a
         // different section of the park's trail network on each variant.
@@ -677,7 +777,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters1, seed: seedNum * 3,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters1, pref),
-          elevIntensity: 1.0,
+          elevIntensity: 1.0, extraWarning: parkWarning,
         });
         await sleep(GH_STAGGER_MS);
 
@@ -685,7 +785,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters2, seed: seedNum * 3 + 1,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters2, pref),
-          elevIntensity: pref === "hills" ? 0.85 : 0.8,
+          elevIntensity: pref === "hills" ? 0.85 : 0.8, extraWarning: parkWarning,
         });
         await sleep(GH_STAGGER_MS);
 
@@ -693,7 +793,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters3, seed: seedNum * 3 + 2,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters3, pref),
-          elevIntensity: pref === "hills" ? 1.55 : 1.25,
+          elevIntensity: pref === "hills" ? 1.55 : 1.25, extraWarning: parkWarning,
         });
 
         return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
