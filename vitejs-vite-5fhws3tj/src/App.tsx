@@ -55,6 +55,8 @@ function StartUpdater({
   return null;
 }
 
+type ElevPoint = { distanceMeters: number; elevation: number };
+
 export default function App() {
   // Core inputs
   const [start, setStart] = useState("1563 Lucretia Ave Los Angeles, CA 90026");
@@ -81,7 +83,7 @@ export default function App() {
   const routeStyle = (idx: number) => {
     const isSel = idx === selectedRouteIndex;
     return {
-      color: isSel ? "#ccff00" : "#3f3f46", // neon vs zinc gray
+      color: isSel ? "#ccff00" : "#3f3f46",
       weight: isSel ? 6 : 3,
       opacity: isSel ? 0.95 : 0.55,
       lineCap: "square" as const,
@@ -92,7 +94,7 @@ export default function App() {
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // IMPORTANT: compute next seed locally so we can send it to /api/route
+    // compute next seed locally so we can send it to /api/route
     const nextSeed = directionSeed + 1;
     setDirectionSeed(nextSeed);
 
@@ -102,23 +104,31 @@ export default function App() {
     setSelectedRouteIndex(0);
 
     try {
-      // 1) Pick a start coordinate (geocode with Nominatim; fallback to LA)
-      let startCoords: [number, number] = [-118.2923, 34.0224]; // [lon, lat]
+      // 1) Geocode start -> startLatLngResolved (always [lat, lng])
+      let startLatLngResolved: [number, number] = [34.0224, -118.2923]; // fallback LA [lat,lng]
 
       try {
         const nomUrl =
           `https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=0` +
           `&q=${encodeURIComponent(start)}` +
           `&email=demo@example.com`;
+
         const res = await fetch(nomUrl);
         const json: any[] = await res.json();
+
         if (json?.length) {
-          startCoords = [parseFloat(json[0].lon), parseFloat(json[0].lat)];
-          setStartLatLng([parseFloat(json[0].lat), parseFloat(json[0].lon)]); // [lat, lon]
+          const lat = parseFloat(json[0].lat);
+          const lon = parseFloat(json[0].lon);
+          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
+            startLatLngResolved = [lat, lon];
+          }
         }
       } catch {
         // ignore; use fallback
       }
+
+      // IMPORTANT: always set startLatLng so the map + marker update even on fallback
+      setStartLatLng(startLatLngResolved);
 
       // 2) Determine target distance in meters
       const targetMiles =
@@ -127,47 +137,50 @@ export default function App() {
           : Math.max(0.5, targetValue / Math.max(1, pace));
       const targetMeters = targetMiles * 1609.34;
 
-      // 3) CALL YOUR VERCEL FUNCTION (server calls GraphHopper)
-      // NOTE:
-      // - startCoords is [lon, lat]
-      // - API expects startLatLng as [lat, lng]
+      // 3) Call /api/route (server calls GraphHopper / fallback)
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 30000); // 30s
+
       const resp = await fetch("/api/route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
-          startLatLng: [startCoords[1], startCoords[0]], // [lat, lng]
+          startLatLng: startLatLngResolved, // [lat,lng]
           routeType,
           targetMeters,
           elevationPref,
           directionSeed: nextSeed,
-          // keeping these in case you want to use them on the server later:
-          loopAtPark,
+          loopAtPark, // optional (server can ignore)
         }),
-      });
+      }).finally(() => window.clearTimeout(timeout));
 
       const json = await resp.json();
       if (!resp.ok) {
         throw new Error(json?.error || "Route request failed");
       }
 
-      // json should be { type: "FeatureCollection", features: [...] }
       setRouteData(json);
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "Something went wrong.");
+      if (err?.name === "AbortError") {
+        setError("Route request timed out (30s). Try again.");
+      } else {
+        setError(err?.message || "Something went wrong.");
+      }
     } finally {
       setLoading(false);
     }
   };
 
-// Safe accessor for the currently selected feature (fallback to 0)
-const selectedFeature =
-  routeData?.features?.[selectedRouteIndex] ?? routeData?.features?.[0] ?? null;
+  // Selected feature + derived props
+  const selectedFeature =
+    routeData?.features?.[selectedRouteIndex] ?? routeData?.features?.[0] ?? null;
 
-const properties = selectedFeature?.properties ?? null;
-const warnings: string[] = (properties?.warnings as string[]) ?? [];
-const elevationProfile =
-  (properties?.elevationProfile as { distanceMeters: number; elevation: number }[]) ?? [];
+  const properties = selectedFeature?.properties ?? null;
+  const warnings: string[] = (properties?.warnings as string[]) ?? [];
+  const elevationProfile: ElevPoint[] =
+    (properties?.elevationProfile as ElevPoint[]) ?? [];
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full bg-black text-white overflow-hidden font-sans">
@@ -393,8 +406,8 @@ const elevationProfile =
 
               {routeData.features.map((feature: any, idx: number) => {
                 const isSelected = selectedRouteIndex === idx;
-                const featMetrics = feature.properties.metrics;
-                const featScoring = feature.properties.scoring;
+                const featMetrics = feature?.properties?.metrics ?? {};
+                const featScoring = feature?.properties?.scoring ?? {};
 
                 return (
                   <button
@@ -414,7 +427,7 @@ const elevationProfile =
                         Route 0{idx + 1}
                       </span>
                       <span className="text-[10px] font-bold text-white tracking-[0.2em] px-2 py-1 border border-zinc-700">
-                        {featScoring.overallScore} MATCH
+                        {featScoring?.overallScore ?? "--"} MATCH
                       </span>
                     </div>
 
@@ -424,7 +437,7 @@ const elevationProfile =
                           Dist
                         </p>
                         <p className="text-xl font-black">
-                          {featMetrics.distanceMiles}
+                          {featMetrics?.distanceMiles ?? "--"}
                           <span className="text-xs text-zinc-500 font-normal ml-1">
                             mi
                           </span>
@@ -436,7 +449,7 @@ const elevationProfile =
                           Est
                         </p>
                         <p className="text-xl font-black">
-                          {featMetrics.timeMinutes}
+                          {featMetrics?.timeMinutes ?? "--"}
                           <span className="text-xs text-zinc-500 font-normal ml-1">
                             m
                           </span>
@@ -448,7 +461,9 @@ const elevationProfile =
                           Climb
                         </p>
                         <p className="text-xl font-black">
-                          {Math.round(featMetrics.totalAscent)}
+                          {featMetrics?.totalAscent != null
+                            ? Math.round(featMetrics.totalAscent)
+                            : "--"}
                           <span className="text-xs text-zinc-500 font-normal ml-1">
                             m
                           </span>
@@ -556,11 +571,11 @@ const elevationProfile =
 
             <div className="h-24 w-full mt-4">
               <ResponsiveContainer width="100%" height="100%">
-               <AreaChart
-  key={`elev-${selectedRouteIndex}-${routeFadeKey}`}
-  data={elevationProfile}
-  margin={{ top: 5, right: 0, left: -20, bottom: 0 }}
->
+                <AreaChart
+                  key={`elev-${selectedRouteIndex}-${routeFadeKey}`}
+                  data={elevationProfile}
+                  margin={{ top: 5, right: 0, left: -20, bottom: 0 }}
+                >
                   <defs>
                     <linearGradient
                       id="colorElevation"
