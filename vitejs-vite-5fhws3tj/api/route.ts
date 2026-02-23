@@ -128,6 +128,23 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills"): number {
 
 // ── GH API ───────────────────────────────────────────────────────────────────
 
+/**
+ * Custom model block that steers the foot profile away from major roads.
+ * Requires ch.disable: true (disables Contraction Hierarchies so GH can apply
+ * per-edge penalties). If GH rejects it (free tier may not support custom
+ * models), callers should retry without it.
+ */
+const AVOID_MAJOR_ROADS_MODEL = {
+  "ch.disable": true,
+  custom_model: {
+    priority: [
+      { if: "road_class == MOTORWAY || road_class == TRUNK", multiply_by: 0.01 },
+      { if: "road_class == PRIMARY", multiply_by: 0.1 },
+      { if: "road_class == SECONDARY", multiply_by: 0.3 },
+    ],
+  },
+};
+
 async function ghPost(key: string, body: object): Promise<any> {
   const url = new URL("https://graphhopper.com/api/1/route");
   url.searchParams.set("key", key);
@@ -155,29 +172,51 @@ async function ghPost(key: string, body: object): Promise<any> {
 
 /**
  * Point-to-point routing — GH finds the best path through all waypoints in order.
- * Used for out-and-back and park loop.
+ * If avoidMajorRoads is true, applies a custom_model penalty. If GH rejects
+ * the custom model (unsupported on free tier), retries without it.
  */
-async function graphHopperRoute(points: LatLon[], key: string, profile: string) {
-  // GH POST body expects [lon, lat] — normalize then swap
+async function graphHopperRoute(
+  points: LatLon[],
+  key: string,
+  profile: string,
+  avoidMajorRoads = false
+) {
   const safePoints = points.map((p, i) => {
     const [lat, lon] = normalizeLatLon(p, `point ${i}`);
     return [lon, lat];
   });
-  const json = await ghPost(key, {
+
+  const baseBody = {
     points: safePoints,
     profile,
     points_encoded: false,
     instructions: false,
     calc_points: true,
     elevation: true,
-  });
-  const path = json?.paths?.[0];
-  const coords: any[] = path?.points?.coordinates ?? [];
-  if (!coords.length) {
-    console.error("GH point-to-point: no coords:", JSON.stringify(json).slice(0, 300));
-    throw new Error("GraphHopper returned no coordinates");
+  };
+
+  const attempts = avoidMajorRoads
+    ? [{ ...baseBody, ...AVOID_MAJOR_ROADS_MODEL }, baseBody]
+    : [baseBody];
+
+  let lastErr: Error | null = null;
+  for (const body of attempts) {
+    try {
+      const json = await ghPost(key, body);
+      const path = json?.paths?.[0];
+      const coords: any[] = path?.points?.coordinates ?? [];
+      if (!coords.length) {
+        console.error("GH point-to-point: no coords:", JSON.stringify(json).slice(0, 300));
+        throw new Error("GraphHopper returned no coordinates");
+      }
+      return { path, coords };
+    } catch (e: any) {
+      lastErr = e;
+      // If custom model was rejected, the fallback attempt (plain body) follows
+      if (attempts.length > 1) console.warn("GH custom_model rejected, retrying without:", e?.message);
+    }
   }
-  return { path, coords };
+  throw lastErr ?? new Error("GraphHopper point-to-point failed");
 }
 
 /**
@@ -194,10 +233,11 @@ async function ghRoundTrip(
   distanceMeters: number,
   seed: number,
   key: string,
-  profile: string
+  profile: string,
+  avoidMajorRoads = false
 ) {
-  const json = await ghPost(key, {
-    points: [[lon, lat]], // single point for round trip
+  const baseBody = {
+    points: [[lon, lat]],
     algorithm: "round_trip",
     "round_trip.distance": Math.round(distanceMeters),
     "round_trip.seed": seed,
@@ -206,14 +246,29 @@ async function ghRoundTrip(
     instructions: false,
     calc_points: true,
     elevation: true,
-  });
-  const path = json?.paths?.[0];
-  const coords: any[] = path?.points?.coordinates ?? [];
-  if (!coords.length) {
-    console.error("GH round_trip: no coords:", JSON.stringify(json).slice(0, 300));
-    throw new Error("GraphHopper round_trip returned no coordinates");
+  };
+
+  const attempts = avoidMajorRoads
+    ? [{ ...baseBody, ...AVOID_MAJOR_ROADS_MODEL }, baseBody]
+    : [baseBody];
+
+  let lastErr: Error | null = null;
+  for (const body of attempts) {
+    try {
+      const json = await ghPost(key, body);
+      const path = json?.paths?.[0];
+      const coords: any[] = path?.points?.coordinates ?? [];
+      if (!coords.length) {
+        console.error("GH round_trip: no coords:", JSON.stringify(json).slice(0, 300));
+        throw new Error("GraphHopper round_trip returned no coordinates");
+      }
+      return { path, coords };
+    } catch (e: any) {
+      lastErr = e;
+      if (attempts.length > 1) console.warn("GH custom_model rejected, retrying without:", e?.message);
+    }
   }
-  return { path, coords };
+  throw lastErr ?? new Error("GraphHopper round_trip failed");
 }
 
 /**
@@ -486,6 +541,7 @@ async function buildParkLoopFeature({
   mockCoords,
   elevIntensity,
   extraWarning,
+  avoidMajorRoads,
 }: {
   lat: number;
   lon: number;
@@ -499,13 +555,15 @@ async function buildParkLoopFeature({
   mockCoords: LonLat[];
   elevIntensity: number;
   extraWarning?: string | null;
+  avoidMajorRoads?: boolean;
 }): Promise<object> {
   try {
     // ── leg 1: home → park center ─────────────────────────────────────────────
     const { path: toPath, coords: toCoords } = await graphHopperRoute(
       [[lat, lon], [parkLat, parkLon]],
       ghKey,
-      "foot"
+      "foot",
+      avoidMajorRoads
     );
     const toDistance = typeof toPath?.distance === "number" ? toPath.distance : 0;
     const toTime = typeof toPath?.time === "number" ? toPath.time : 0;
@@ -520,7 +578,7 @@ async function buildParkLoopFeature({
     const lapMeters = loopBudget / laps;
 
     const { path: loopPath, coords: lapCoords } = await ghRoundTrip(
-      parkLat, parkLon, lapMeters, seed, ghKey, "foot"
+      parkLat, parkLon, lapMeters, seed, ghKey, "foot", avoidMajorRoads
     );
     const lapActualDistance =
       typeof loopPath?.distance === "number" ? loopPath.distance : lapMeters;
@@ -583,7 +641,7 @@ async function buildParkLoopFeature({
  * Used for out-and-back and park loop.
  */
 async function buildPointToPointFeature({
-  waypoints, mockCoords, targetMeters, pref, ghKey, ghProfile, elevIntensity,
+  waypoints, mockCoords, targetMeters, pref, ghKey, ghProfile, elevIntensity, avoidMajorRoads,
 }: {
   waypoints: LatLon[];
   mockCoords: LonLat[];
@@ -592,10 +650,11 @@ async function buildPointToPointFeature({
   ghKey: string | undefined;
   ghProfile: string;
   elevIntensity: number;
+  avoidMajorRoads?: boolean;
 }): Promise<object> {
   if (ghKey) {
     try {
-      const { path, coords } = await graphHopperRoute(waypoints, ghKey, ghProfile);
+      const { path, coords } = await graphHopperRoute(waypoints, ghKey, ghProfile, avoidMajorRoads);
       return parseGHFeature(path, coords, targetMeters, pref, elevIntensity);
     } catch (e: any) {
       const msg: string = e?.message ?? String(e);
@@ -618,7 +677,7 @@ async function buildPointToPointFeature({
  * Each unique seed produces a genuinely different loop.
  */
 async function buildRoundTripFeature({
-  lat, lon, targetMeters, seed, mockCoords, pref, ghKey, ghProfile, elevIntensity,
+  lat, lon, targetMeters, seed, mockCoords, pref, ghKey, ghProfile, elevIntensity, avoidMajorRoads,
 }: {
   lat: number;
   lon: number;
@@ -629,10 +688,11 @@ async function buildRoundTripFeature({
   ghKey: string | undefined;
   ghProfile: string;
   elevIntensity: number;
+  avoidMajorRoads?: boolean;
 }): Promise<object> {
   if (ghKey) {
     try {
-      const { path, coords } = await ghRoundTrip(lat, lon, targetMeters, seed, ghKey, ghProfile);
+      const { path, coords } = await ghRoundTrip(lat, lon, targetMeters, seed, ghKey, ghProfile, avoidMajorRoads);
       return parseGHFeature(path, coords, targetMeters, pref, elevIntensity);
     } catch (e: any) {
       const msg: string = e?.message ?? String(e);
@@ -671,8 +731,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       directionSeed,
       surfacePref,
       loopAtPark,
-      parkSearch, // optional park name typed by the user
+      parkSearch,
+      avoidMajorRoads,
     } = body;
+
+    const avoidMajor: boolean = avoidMajorRoads === true;
 
     if (!startLatLng) return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
     if (!targetMeters || typeof targetMeters !== "number")
@@ -714,7 +777,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const f1 = await buildPointToPointFeature({
         waypoints: buildOutAndBackWaypoints(lat, lon, meters1, bearing),
         mockCoords: makeOutAndBack(startLonLat, meters1, bearing),
-        targetMeters: meters1, pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0,
+        targetMeters: meters1, pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0, avoidMajorRoads: avoidMajor,
       });
       await sleep(GH_STAGGER_MS);
 
@@ -722,7 +785,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         waypoints: buildOutAndBackWaypoints(lat, lon, meters2, bearing2),
         mockCoords: makeOutAndBack(startLonLat, meters2, bearing2),
         targetMeters: meters2, pref, ghKey: GH_KEY, ghProfile,
-        elevIntensity: pref === "hills" ? 0.85 : 0.8,
+        elevIntensity: pref === "hills" ? 0.85 : 0.8, avoidMajorRoads: avoidMajor,
       });
       await sleep(GH_STAGGER_MS);
 
@@ -730,7 +793,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         waypoints: buildOutAndBackWaypoints(lat, lon, meters3, bearing3),
         mockCoords: makeOutAndBack(startLonLat, meters3, bearing3),
         targetMeters: meters3, pref, ghKey: GH_KEY, ghProfile,
-        elevIntensity: pref === "hills" ? 1.55 : 1.25,
+        elevIntensity: pref === "hills" ? 1.55 : 1.25, avoidMajorRoads: avoidMajor,
       });
 
       return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
@@ -783,7 +846,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters1, seed: seedNum * 3,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters1, pref),
-          elevIntensity: 1.0, extraWarning: parkWarning,
+          elevIntensity: 1.0, extraWarning: parkWarning, avoidMajorRoads: avoidMajor,
         });
         await sleep(GH_STAGGER_MS);
 
@@ -791,7 +854,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters2, seed: seedNum * 3 + 1,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters2, pref),
-          elevIntensity: pref === "hills" ? 0.85 : 0.8, extraWarning: parkWarning,
+          elevIntensity: pref === "hills" ? 0.85 : 0.8, extraWarning: parkWarning, avoidMajorRoads: avoidMajor,
         });
         await sleep(GH_STAGGER_MS);
 
@@ -799,7 +862,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lat, lon, parkLat: park.lat, parkLon: park.lon, parkName: park.name,
           targetMeters: meters3, seed: seedNum * 3 + 2,
           pref, ghKey: GH_KEY!, mockCoords: makeLoop(startLonLat, meters3, pref),
-          elevIntensity: pref === "hills" ? 1.55 : 1.25, extraWarning: parkWarning,
+          elevIntensity: pref === "hills" ? 1.55 : 1.25, extraWarning: parkWarning, avoidMajorRoads: avoidMajor,
         });
 
         return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
@@ -817,7 +880,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const f1 = await buildRoundTripFeature({
       lat, lon, targetMeters: meters1, seed: seedNum * 3,
       mockCoords: makeLoop(startLonLat, meters1, pref),
-      pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0,
+      pref, ghKey: GH_KEY, ghProfile, elevIntensity: 1.0, avoidMajorRoads: avoidMajor,
     });
     await sleep(GH_STAGGER_MS);
 
@@ -825,7 +888,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       lat, lon, targetMeters: meters2, seed: seedNum * 3 + 1,
       mockCoords: makeLoop(startLonLat, meters2, pref),
       pref, ghKey: GH_KEY, ghProfile,
-      elevIntensity: pref === "hills" ? 0.85 : 0.8,
+      elevIntensity: pref === "hills" ? 0.85 : 0.8, avoidMajorRoads: avoidMajor,
     });
     await sleep(GH_STAGGER_MS);
 
@@ -833,7 +896,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       lat, lon, targetMeters: meters3, seed: seedNum * 3 + 2,
       mockCoords: makeLoop(startLonLat, meters3, pref),
       pref, ghKey: GH_KEY, ghProfile,
-      elevIntensity: pref === "hills" ? 1.55 : 1.25,
+      elevIntensity: pref === "hills" ? 1.55 : 1.25, avoidMajorRoads: avoidMajor,
     });
 
     return res.status(200).json({ type: "FeatureCollection", features: [f1, f2, f3] });
