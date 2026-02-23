@@ -47,7 +47,11 @@ function normalizeLatLon(p: any, label = "point"): LatLon {
 }
 
 // Simple geometry generators (fallback if GraphHopper fails)
-function makeLoop(startLonLat: LonLat, targetMeters: number, hilliness: "flat" | "hills") {
+function makeLoop(
+  startLonLat: LonLat,
+  targetMeters: number,
+  hilliness: "flat" | "hills"
+) {
   const points = 70;
   const radius = targetMeters / (2 * Math.PI);
   const coords: LonLat[] = [];
@@ -63,7 +67,11 @@ function makeLoop(startLonLat: LonLat, targetMeters: number, hilliness: "flat" |
   return coords;
 }
 
-function makeOutAndBack(startLonLat: LonLat, targetMeters: number, bearingDeg: number) {
+function makeOutAndBack(
+  startLonLat: LonLat,
+  targetMeters: number,
+  bearingDeg: number
+) {
   const oneWay = targetMeters / 2;
   const b = (bearingDeg * Math.PI) / 180;
   const dx = metersToLon(oneWay * Math.cos(b), startLonLat[1]);
@@ -72,7 +80,11 @@ function makeOutAndBack(startLonLat: LonLat, targetMeters: number, bearingDeg: n
   return [startLonLat, out, startLonLat];
 }
 
-function fakeElevationProfile(lenMeters: number, pref: "flat" | "hills", intensity = 1) {
+function fakeElevationProfile(
+  lenMeters: number,
+  pref: "flat" | "hills",
+  intensity = 1
+) {
   const pts = 50;
   const out: { distanceMeters: number; elevation: number }[] = [];
   const base = 120;
@@ -83,7 +95,9 @@ function fakeElevationProfile(lenMeters: number, pref: "flat" | "hills", intensi
     const elev =
       base +
       amp * Math.sin((i / pts) * 2 * Math.PI) +
-      (pref === "hills" ? amp * 0.4 * Math.sin((i / pts) * 6 * Math.PI) : 0);
+      (pref === "hills"
+        ? amp * 0.4 * Math.sin((i / pts) * 6 * Math.PI)
+        : 0);
     out.push({ distanceMeters: d, elevation: Math.round(elev) });
   }
   return out;
@@ -126,11 +140,28 @@ async function graphHopperRoute(points: LatLon[], key: string) {
   ghUrl.searchParams.set("calc_points", "true");
   ghUrl.searchParams.set("elevation", "true");
 
-  const ghResp = await fetch(ghUrl.toString(), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ points: safePoints }),
-  });
+  // ✅ Hard timeout so POST can’t hang forever
+  const ac = new AbortController();
+  const timeoutMs = 8000; // 8s is a good balance for serverless
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+
+  let ghResp: Response;
+  try {
+    ghResp = await fetch(ghUrl.toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points: safePoints }),
+      signal: ac.signal,
+    });
+  } catch (e: any) {
+    // Abort => treat as GH timeout
+    if (e?.name === "AbortError") {
+      throw new Error(`GraphHopper timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
 
   const ghJson: any = await ghResp.json().catch(() => ({}));
 
@@ -151,27 +182,32 @@ async function graphHopperRoute(points: LatLon[], key: string) {
 
 export default async function handler(req: Request): Promise<Response> {
   try {
-    // Healthcheck should NEVER hang
+    // ✅ Healthcheck should NEVER hang (no body parsing before this)
     if (req.method === "GET") {
-      return json({ ok: true, message: "API is alive. Use POST to generate routes." });
+      return json({
+        ok: true,
+        message: "API is alive. Use POST to generate routes.",
+      });
     }
     if (req.method !== "POST") {
       return json({ error: "Use POST" }, 405);
     }
 
     const body = await readJson(req);
-    const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } = body || {};
+    const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } =
+      body || {};
 
     if (!startLatLng) return json({ error: "Missing startLatLng: [lat,lng]" }, 400);
     if (!targetMeters || typeof targetMeters !== "number")
       return json({ error: "Missing targetMeters (number)" }, 400);
 
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
-    const type: "loop" | "out-and-back" = routeType === "out-and-back" ? "out-and-back" : "loop";
+    const type: "loop" | "out-and-back" =
+      routeType === "out-and-back" ? "out-and-back" : "loop";
 
-    // Normalize incoming startLatLng to [lat, lon]
+    // ✅ Normalize incoming startLatLng to [lat, lon] (swap-protection)
     const [lat, lon] = normalizeLatLon(startLatLng, "startLatLng");
-    const startLonLat: LonLat = [lon, lat]; // for GeoJSON + our geometry helpers
+    const startLonLat: LonLat = [lon, lat]; // for GeoJSON + geometry helpers
 
     // Bearings that cycle as you click Generate
     const candidates =
@@ -211,7 +247,10 @@ export default async function handler(req: Request): Promise<Response> {
         const coordsLonLat: LonLat[] = coords.map((c: any) => [c[0], c[1]]);
 
         // Elevation profile from GH if present
-        const altitudes = coords.map((c: any) => c?.[2]).filter((n: any) => typeof n === "number");
+        const altitudes = coords
+          .map((c: any) => c?.[2])
+          .filter((n: any) => typeof n === "number");
+
         let elevProfile: { distanceMeters: number; elevation: number }[] = [];
         if (altitudes.length > 2) {
           const total = typeof path?.distance === "number" ? path.distance : targetMeters;
@@ -234,7 +273,7 @@ export default async function handler(req: Request): Promise<Response> {
             ? Math.round(path.time / 1000 / 60)
             : Math.round(distanceMiles * 10);
 
-        // Route 2/3 still mock for now (we’ll make them GH alternates after this is stable)
+        // Route 2/3 mock for now (we can GH-ify once 100% stable)
         const meters2 = targetMeters * 0.98;
         const meters3 = targetMeters * 1.02;
 
@@ -308,7 +347,7 @@ export default async function handler(req: Request): Promise<Response> {
           ],
         });
       } catch (e: any) {
-        // If GH fails, drop to mock (but GH failure should not break GET)
+        // If GH fails, drop to mock (GET remains instant regardless)
         console.warn("GraphHopper route failed, falling back to mock:", e?.message || e);
       }
     }
