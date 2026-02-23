@@ -160,11 +160,14 @@ export default function App() {
     }
   };
 
-  // Safe accessor for the currently selected feature
-const selectedFeature = routeData?.features?.[selectedRouteIndex];
-const properties = selectedFeature?.properties;
-const warnings = properties?.warnings || [];
-const elevationProfile = properties?.elevationProfile;
+// Safe accessor for the currently selected feature (fallback to 0)
+const selectedFeature =
+  routeData?.features?.[selectedRouteIndex] ?? routeData?.features?.[0] ?? null;
+
+const properties = selectedFeature?.properties ?? null;
+const warnings: string[] = (properties?.warnings as string[]) ?? [];
+const elevationProfile =
+  (properties?.elevationProfile as { distanceMeters: number; elevation: number }[]) ?? [];
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full bg-black text-white overflow-hidden font-sans">
