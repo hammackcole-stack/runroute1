@@ -1,9 +1,5 @@
 // api/route.ts
 
-export const config = {
-  runtime: "nodejs",
-};
-
 type LatLng = [number, number]; // [lat, lng]
 type LonLat = [number, number]; // [lon, lat]
 
@@ -15,7 +11,11 @@ function metersToLat(m: number) {
 }
 
 // Simple geometry generators (fallback if GraphHopper fails)
-function makeLoop(startLonLat: LonLat, targetMeters: number, hilliness: "flat" | "hills") {
+function makeLoop(
+  startLonLat: LonLat,
+  targetMeters: number,
+  hilliness: "flat" | "hills"
+) {
   const points = 70;
   const radius = targetMeters / (2 * Math.PI);
   const coords: LonLat[] = [];
@@ -40,17 +40,26 @@ function makeOutAndBack(startLonLat: LonLat, targetMeters: number, bearingDeg: n
   return [startLonLat, out, startLonLat];
 }
 
-function fakeElevationProfile(lenMeters: number, pref: "flat" | "hills") {
+// ✅ NOW supports intensity so each route can have different “hilliness”
+function fakeElevationProfile(
+  lenMeters: number,
+  pref: "flat" | "hills",
+  intensity = 1
+) {
   const pts = 50;
   const out: { distanceMeters: number; elevation: number }[] = [];
   const base = 120;
-  const amp = pref === "hills" ? 35 : 8;
+  const amp = (pref === "hills" ? 35 : 8) * intensity;
+
   for (let i = 0; i <= pts; i++) {
     const d = (i / pts) * lenMeters;
     const elev =
       base +
       amp * Math.sin((i / pts) * 2 * Math.PI) +
-      (pref === "hills" ? amp * 0.4 * Math.sin((i / pts) * 6 * Math.PI) : 0);
+      (pref === "hills"
+        ? amp * 0.4 * Math.sin((i / pts) * 6 * Math.PI)
+        : 0);
+
     out.push({ distanceMeters: d, elevation: Math.round(elev) });
   }
   return out;
@@ -73,24 +82,44 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills") {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
-export default async function handler(req: any, res: any) {
+// Helper to safely read JSON body on Vercel Edge/Node variations
+async function readJson(req: Request): Promise<any> {
   try {
-    // QUICK “ping” so /api/route loads instantly in a browser
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+export const config = {
+  runtime: "nodejs",
+};
+
+export default async function handler(req: Request): Promise<Response> {
+  try {
     if (req.method === "GET") {
-      return res.status(200).json({ ok: true, message: "API is alive. Use POST to generate routes." });
+      return Response.json({ ok: true, message: "API is alive. Use POST to generate routes." });
     }
 
     if (req.method !== "POST") {
-      return res.status(405).json({ error: "Use POST" });
+      return Response.json({ error: "Use POST" }, { status: 405 });
     }
 
-    const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } = req.body || {};
+    const body = await readJson(req);
+
+    const {
+      startLatLng,
+      routeType,
+      targetMeters,
+      elevationPref,
+      directionSeed,
+    } = body || {};
 
     if (!startLatLng || !Array.isArray(startLatLng) || startLatLng.length !== 2) {
-      return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
+      return Response.json({ error: "Missing startLatLng: [lat,lng]" }, { status: 400 });
     }
     if (!targetMeters || typeof targetMeters !== "number") {
-      return res.status(400).json({ error: "Missing targetMeters (number)" });
+      return Response.json({ error: "Missing targetMeters (number)" }, { status: 400 });
     }
 
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
@@ -99,6 +128,7 @@ export default async function handler(req: any, res: any) {
     const [lat, lng] = startLatLng as LatLng;
     const startLonLat: LonLat = [lng, lat];
 
+    // Cycle bearings so "Generate" changes direction
     const candidates =
       pref === "hills"
         ? [25, 70, 115, 160, 205, 250, 295, 340]
@@ -107,9 +137,11 @@ export default async function handler(req: any, res: any) {
     const seedNum = typeof directionSeed === "number" ? directionSeed : 0;
     const bearing = candidates[seedNum % candidates.length];
 
+    // ----------------------------
+    // Try GraphHopper (real roads)
+    // ----------------------------
     const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
 
-    // --- Try GraphHopper ---
     if (GH_KEY) {
       try {
         const points: LatLng[] = [];
@@ -137,48 +169,61 @@ export default async function handler(req: any, res: any) {
         ghUrl.searchParams.set("calc_points", "true");
         ghUrl.searchParams.set("elevation", "true");
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-
         const ghResp = await fetch(ghUrl.toString(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ points }),
-          signal: controller.signal,
-        }).finally(() => clearTimeout(timeout));
+        });
 
-        const ghJson: any = await ghResp.json().catch(() => ({}));
-        if (!ghResp.ok) throw new Error(ghJson?.message || "GraphHopper failed");
+        const ghJson: any = await ghResp.json();
+
+        if (!ghResp.ok) {
+          const msg =
+            ghJson?.message ||
+            ghJson?.error ||
+            `GraphHopper error (status ${ghResp.status})`;
+          throw new Error(msg);
+        }
 
         const path = ghJson?.paths?.[0];
-        const coordsLonLat: LonLat[] = path?.points?.coordinates || [];
+        const coordsLonLat: any[] = path?.points?.coordinates || [];
         if (!coordsLonLat.length) throw new Error("GraphHopper returned no coordinates");
 
+        // Elev profile from GH if it includes altitude in third dimension
         let elevProfile: { distanceMeters: number; elevation: number }[] = [];
-        const ghElev = coordsLonLat
-          .map((c: any) => c?.[2])
-          .filter((n: any) => typeof n === "number");
+        const altitudes = coordsLonLat
+          .map((c) => c?.[2])
+          .filter((n) => typeof n === "number");
 
-        if (ghElev.length) {
+        if (altitudes.length > 2) {
           const total = typeof path?.distance === "number" ? path.distance : targetMeters;
-          const step = total / Math.max(1, ghElev.length - 1);
-          elevProfile = ghElev.map((e: number, i: number) => ({
+          const step = total / (altitudes.length - 1);
+          elevProfile = altitudes.map((e: number, i: number) => ({
             distanceMeters: i * step,
             elevation: Math.round(e),
           }));
         } else {
-          elevProfile = fakeElevationProfile(targetMeters, pref);
+          elevProfile = fakeElevationProfile(targetMeters, pref, 1);
         }
 
         const ascent = computeAscent(elevProfile);
         const score = scoreRoute(ascent, pref);
 
-        const distanceMiles = ((path?.distance ?? targetMeters) / 1609.34) || (targetMeters / 1609.34);
-        const timeMinutes = path?.time ? Math.round(path.time / 1000 / 60) : Math.round(distanceMiles * 10);
+        const distanceMiles =
+          (typeof path?.distance === "number" ? path.distance : targetMeters) / 1609.34;
 
+        const timeMinutes =
+          typeof path?.time === "number"
+            ? Math.round(path.time / 1000 / 60)
+            : Math.round(distanceMiles * 10);
+
+        // ✅ Route 1: GH result
         const feature1 = {
           type: "Feature",
-          geometry: { type: "LineString", coordinates: coordsLonLat.map((c: any) => [c[0], c[1]]) },
+          geometry: {
+            type: "LineString",
+            coordinates: coordsLonLat.map((c) => [c[0], c[1]]), // [lon,lat]
+          },
           properties: {
             metrics: {
               distanceMiles: Number(distanceMiles.toFixed(2)),
@@ -193,19 +238,23 @@ export default async function handler(req: any, res: any) {
           },
         };
 
-        // Keep 2/3 as mock alternates for now
+        // ✅ Route 2/3: distinct mock alternates (different geometry + different elevation intensity)
+        const meters2 = targetMeters * 0.98;
+        const meters3 = targetMeters * 1.02;
+
         const feature2Coords =
           type === "out-and-back"
-            ? makeOutAndBack(startLonLat, targetMeters * 0.98, bearing + 35)
-            : makeLoop(startLonLat, targetMeters * 0.92, pref);
+            ? makeOutAndBack(startLonLat, meters2, bearing + 35)
+            : makeLoop(startLonLat, meters2, pref);
 
         const feature3Coords =
           type === "out-and-back"
-            ? makeOutAndBack(startLonLat, targetMeters * 1.02, bearing + 70)
-            : makeLoop(startLonLat, targetMeters * 1.08, pref);
+            ? makeOutAndBack(startLonLat, meters3, bearing + 70)
+            : makeLoop(startLonLat, meters3, pref);
 
-        const elev2 = fakeElevationProfile(targetMeters, pref);
-        const elev3 = fakeElevationProfile(targetMeters, pref);
+        const elev2 = fakeElevationProfile(meters2, pref, pref === "hills" ? 0.9 : 0.8);
+        const elev3 = fakeElevationProfile(meters3, pref, pref === "hills" ? 1.5 : 1.25);
+
         const asc2 = computeAscent(elev2);
         const asc3 = computeAscent(elev3);
 
@@ -214,8 +263,8 @@ export default async function handler(req: any, res: any) {
           geometry: { type: "LineString", coordinates: feature2Coords },
           properties: {
             metrics: {
-              distanceMiles: Number(((targetMeters * 0.98) / 1609.34).toFixed(2)),
-              timeMinutes: Math.round(((targetMeters * 0.98) / 1609.34) * 10),
+              distanceMiles: Number((meters2 / 1609.34).toFixed(2)),
+              timeMinutes: Math.round((meters2 / 1609.34) * 10),
               totalAscent: asc2,
               totalDescent: asc2,
             },
@@ -231,8 +280,8 @@ export default async function handler(req: any, res: any) {
           geometry: { type: "LineString", coordinates: feature3Coords },
           properties: {
             metrics: {
-              distanceMiles: Number(((targetMeters * 1.02) / 1609.34).toFixed(2)),
-              timeMinutes: Math.round(((targetMeters * 1.02) / 1609.34) * 10),
+              distanceMiles: Number((meters3 / 1609.34).toFixed(2)),
+              timeMinutes: Math.round((meters3 / 1609.34) * 10),
               totalAscent: asc3,
               totalDescent: asc3,
             },
@@ -243,90 +292,104 @@ export default async function handler(req: any, res: any) {
           },
         };
 
-        return res.status(200).json({ type: "FeatureCollection", features: [feature1, feature2, feature3] });
+        return Response.json({
+          type: "FeatureCollection",
+          features: [feature1, feature2, feature3],
+        });
       } catch (e: any) {
+        // Fall through to mock
         console.warn("GraphHopper route failed, falling back to mock:", e?.message || e);
       }
     }
 
-    // --- Fallback: mock geometry ---
+    // ----------------------------
+    // Fallback: geometry-only mock (✅ now with different elevation per route)
+    // ----------------------------
+    const meters1 = targetMeters;
+    const meters2 = targetMeters * 0.98;
+    const meters3 = targetMeters * 1.02;
+
     const coords1 =
       type === "out-and-back"
-        ? makeOutAndBack(startLonLat, targetMeters, bearing)
-        : makeLoop(startLonLat, targetMeters, pref);
+        ? makeOutAndBack(startLonLat, meters1, bearing)
+        : makeLoop(startLonLat, meters1, pref);
 
     const coords2 =
       type === "out-and-back"
-        ? makeOutAndBack(startLonLat, targetMeters * 0.98, bearing + 35)
-        : makeLoop(startLonLat, targetMeters * 0.92, pref);
+        ? makeOutAndBack(startLonLat, meters2, bearing + 35)
+        : makeLoop(startLonLat, meters2, pref);
 
     const coords3 =
       type === "out-and-back"
-        ? makeOutAndBack(startLonLat, targetMeters * 1.02, bearing + 70)
-        : makeLoop(startLonLat, targetMeters * 1.08, pref);
+        ? makeOutAndBack(startLonLat, meters3, bearing + 70)
+        : makeLoop(startLonLat, meters3, pref);
 
-    const elev1 = fakeElevationProfile(targetMeters, pref);
-    const elev2 = fakeElevationProfile(targetMeters, pref);
-    const elev3 = fakeElevationProfile(targetMeters, pref);
+    // ✅ different intensities => different ascent => different score
+    const elev1 = fakeElevationProfile(meters1, pref, pref === "hills" ? 1.0 : 1.0);
+    const elev2 = fakeElevationProfile(meters2, pref, pref === "hills" ? 0.85 : 0.8);
+    const elev3 = fakeElevationProfile(meters3, pref, pref === "hills" ? 1.55 : 1.25);
 
     const asc1 = computeAscent(elev1);
     const asc2 = computeAscent(elev2);
     const asc3 = computeAscent(elev3);
 
-    const features = [
-      {
-        type: "Feature",
-        geometry: { type: "LineString", coordinates: coords1 },
-        properties: {
-          metrics: {
-            distanceMiles: Number((targetMeters / 1609.34).toFixed(2)),
-            timeMinutes: Math.round((targetMeters / 1609.34) * 10),
-            totalAscent: asc1,
-            totalDescent: asc1,
-          },
-          scoring: { overallScore: scoreRoute(asc1, pref) },
-          warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server."],
-          elevationProfile: elev1,
-          source: "mock",
+    const feature1 = {
+      type: "Feature",
+      geometry: { type: "LineString", coordinates: coords1 },
+      properties: {
+        metrics: {
+          distanceMiles: Number((meters1 / 1609.34).toFixed(2)),
+          timeMinutes: Math.round((meters1 / 1609.34) * 10),
+          totalAscent: asc1,
+          totalDescent: asc1,
         },
+        scoring: { overallScore: scoreRoute(asc1, pref) },
+        warnings: ["GraphHopper failed; using mock."],
+        elevationProfile: elev1,
+        source: "mock",
       },
-      {
-        type: "Feature",
-        geometry: { type: "LineString", coordinates: coords2 },
-        properties: {
-          metrics: {
-            distanceMiles: Number(((targetMeters * 0.98) / 1609.34).toFixed(2)),
-            timeMinutes: Math.round(((targetMeters * 0.98) / 1609.34) * 10),
-            totalAscent: asc2,
-            totalDescent: asc2,
-          },
-          scoring: { overallScore: scoreRoute(asc2, pref) },
-          warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server."],
-          elevationProfile: elev2,
-          source: "mock",
-        },
-      },
-      {
-        type: "Feature",
-        geometry: { type: "LineString", coordinates: coords3 },
-        properties: {
-          metrics: {
-            distanceMiles: Number(((targetMeters * 1.02) / 1609.34).toFixed(2)),
-            timeMinutes: Math.round(((targetMeters * 1.02) / 1609.34) * 10),
-            totalAscent: asc3,
-            totalDescent: asc3,
-          },
-          scoring: { overallScore: scoreRoute(asc3, pref) },
-          warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server."],
-          elevationProfile: elev3,
-          source: "mock",
-        },
-      },
-    ];
+    };
 
-    return res.status(200).json({ type: "FeatureCollection", features });
+    const feature2 = {
+      type: "Feature",
+      geometry: { type: "LineString", coordinates: coords2 },
+      properties: {
+        metrics: {
+          distanceMiles: Number((meters2 / 1609.34).toFixed(2)),
+          timeMinutes: Math.round((meters2 / 1609.34) * 10),
+          totalAscent: asc2,
+          totalDescent: asc2,
+        },
+        scoring: { overallScore: scoreRoute(asc2, pref) },
+        warnings: ["GraphHopper failed; using mock."],
+        elevationProfile: elev2,
+        source: "mock",
+      },
+    };
+
+    const feature3 = {
+      type: "Feature",
+      geometry: { type: "LineString", coordinates: coords3 },
+      properties: {
+        metrics: {
+          distanceMiles: Number((meters3 / 1609.34).toFixed(2)),
+          timeMinutes: Math.round((meters3 / 1609.34) * 10),
+          totalAscent: asc3,
+          totalDescent: asc3,
+        },
+        scoring: { overallScore: scoreRoute(asc3, pref) },
+        warnings: ["GraphHopper failed; using mock."],
+        elevationProfile: elev3,
+        source: "mock",
+      },
+    };
+
+    return Response.json({
+      type: "FeatureCollection",
+      features: [feature1, feature2, feature3],
+    });
   } catch (e: any) {
     console.error(e);
-    return res.status(500).json({ error: e?.message || "Server error" });
+    return Response.json({ error: e?.message || "Server error" }, { status: 500 });
   }
 }
