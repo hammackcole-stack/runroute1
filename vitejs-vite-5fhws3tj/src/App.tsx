@@ -56,12 +56,19 @@ function StartUpdater({ startLatLng }: { startLatLng: [number, number] | null })
   return null;
 }
 
+const HOME_ADDRESS = "1563 Lucretia Ave Los Angeles, CA 90026";
+const HOME_LATLNG: [number, number] = [34.0822, -118.2559]; // [lat, lon]
+
+function resolveAddress(input: string): string {
+  return input.trim().toUpperCase() === "HOME" ? HOME_ADDRESS : input.trim();
+}
+
 export default function App() {
   // Core inputs
-  const [start, setStart] = useState("1563 Lucretia Ave Los Angeles, CA 90026");
+  const [start, setStart] = useState("HOME");
   const [waypoint, setWaypoint] = useState("");
   const [routeType, setRouteType] = useState<"loop" | "out-and-back">("loop");
-  const [startLatLng, setStartLatLng] = useState<[number, number] | null>(null);
+  const [startLatLng, setStartLatLng] = useState<[number, number] | null>(HOME_LATLNG);
   const [directionSeed, setDirectionSeed] = useState(0);
 
   // Park search (optional — used when Park Loop is selected)
@@ -158,23 +165,28 @@ export default function App() {
     const t = setTimeout(() => controller.abort(), 30000);
 
     try {
-      // 1) Geocode (Nominatim). fallback to LA.
-      let startCoordsLonLat: [number, number] = [-118.2923, 34.0224]; // [lon, lat]
+      // 1) Geocode. "HOME" resolves directly to the hardcoded home coords — no
+      //    Nominatim request needed. Anything else goes through Nominatim with
+      //    a fallback to home if the lookup fails.
+      let startCoordsLonLat: [number, number] = [HOME_LATLNG[1], HOME_LATLNG[0]]; // [lon, lat]
 
-      try {
-        const nomUrl =
-          `https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=0` +
-          `&q=${encodeURIComponent(start)}` +
-          `&email=demo@example.com`;
-        const res = await fetch(nomUrl);
-        const json: any[] = await res.json();
-        if (json?.length) {
-          startCoordsLonLat = [parseFloat(json[0].lon), parseFloat(json[0].lat)];
-          setStartLatLng([parseFloat(json[0].lat), parseFloat(json[0].lon)]); // [lat, lon]
+      if (start.trim().toUpperCase() === "HOME") {
+        setStartLatLng(HOME_LATLNG);
+      } else {
+        try {
+          const nomUrl =
+            `https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=0` +
+            `&q=${encodeURIComponent(resolveAddress(start))}` +
+            `&email=demo@example.com`;
+          const res = await fetch(nomUrl);
+          const json: any[] = await res.json();
+          if (json?.length) {
+            startCoordsLonLat = [parseFloat(json[0].lon), parseFloat(json[0].lat)];
+            setStartLatLng([parseFloat(json[0].lat), parseFloat(json[0].lon)]);
+          }
+        } catch {
+          setStartLatLng([startCoordsLonLat[1], startCoordsLonLat[0]]);
         }
-      } catch {
-        // ignore; use fallback
-        setStartLatLng([startCoordsLonLat[1], startCoordsLonLat[0]]);
       }
 
       // 2) Determine target distance in meters
@@ -600,7 +612,7 @@ export default function App() {
 
         <div className="flex-1 relative z-0 bg-black">
           <MapContainer
-            center={startLatLng ?? [40.7829, -73.9654]}
+            center={startLatLng ?? HOME_LATLNG}
             zoom={13}
             style={{ width: "100%", height: "100%" }}
             className="w-full h-full bg-black"
