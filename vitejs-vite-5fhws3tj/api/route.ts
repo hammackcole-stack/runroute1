@@ -31,7 +31,11 @@ function makeLoop(
   return coords;
 }
 
-function makeOutAndBack(startLonLat: LonLat, targetMeters: number, bearingDeg: number) {
+function makeOutAndBack(
+  startLonLat: LonLat,
+  targetMeters: number,
+  bearingDeg: number
+) {
   const oneWay = targetMeters / 2;
   const b = (bearingDeg * Math.PI) / 180;
   const dx = metersToLon(oneWay * Math.cos(b), startLonLat[1]);
@@ -98,7 +102,10 @@ export const config = {
 export default async function handler(req: Request): Promise<Response> {
   try {
     if (req.method === "GET") {
-      return Response.json({ ok: true, message: "API is alive. Use POST to generate routes." });
+      return Response.json({
+        ok: true,
+        message: "API is alive. Use POST to generate routes.",
+      });
     }
 
     if (req.method !== "POST") {
@@ -107,23 +114,29 @@ export default async function handler(req: Request): Promise<Response> {
 
     const body = await readJson(req);
 
-    const {
-      startLatLng,
-      routeType,
-      targetMeters,
-      elevationPref,
-      directionSeed,
-    } = body || {};
+    const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } =
+      body || {};
 
-    if (!startLatLng || !Array.isArray(startLatLng) || startLatLng.length !== 2) {
-      return Response.json({ error: "Missing startLatLng: [lat,lng]" }, { status: 400 });
+    if (
+      !startLatLng ||
+      !Array.isArray(startLatLng) ||
+      startLatLng.length !== 2
+    ) {
+      return Response.json(
+        { error: "Missing startLatLng: [lat,lng]" },
+        { status: 400 }
+      );
     }
     if (!targetMeters || typeof targetMeters !== "number") {
-      return Response.json({ error: "Missing targetMeters (number)" }, { status: 400 });
+      return Response.json(
+        { error: "Missing targetMeters (number)" },
+        { status: 400 }
+      );
     }
 
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
-    const type: "loop" | "out-and-back" = routeType === "out-and-back" ? "out-and-back" : "loop";
+    const type: "loop" | "out-and-back" =
+      routeType === "out-and-back" ? "out-and-back" : "loop";
 
     const [lat, lng] = startLatLng as LatLng;
     const startLonLat: LonLat = [lng, lat];
@@ -144,21 +157,38 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (GH_KEY) {
       try {
-        const points: LatLng[] = [];
+        // IMPORTANT:
+        // GraphHopper expects points as [lon, lat]
+        // Our request uses startLatLng as [lat, lng]
+        const points: LonLat[] = [];
 
         if (type === "out-and-back") {
           const oneWay = targetMeters / 2;
           const b = (bearing * Math.PI) / 180;
           const dLon = metersToLon(oneWay * Math.cos(b), lat);
           const dLat = metersToLat(oneWay * Math.sin(b));
-          const mid: LatLng = [lat + dLat, lng + dLon];
-          points.push([lat, lng], mid, [lat, lng]);
+
+          // mid in [lat, lng]
+          const midLatLng: LatLng = [lat + dLat, lng + dLon];
+
+          // push as [lon, lat]
+          points.push([lng, lat], [midLatLng[1], midLatLng[0]], [lng, lat]);
         } else {
           const r = targetMeters / (2 * Math.PI);
-          const p1: LatLng = [lat + metersToLat(r), lng];
-          const p2: LatLng = [lat, lng + metersToLon(r, lat)];
-          const p3: LatLng = [lat - metersToLat(r), lng];
-          points.push([lat, lng], p1, p2, p3, [lat, lng]);
+
+          // p1/p2/p3 in [lat, lng]
+          const p1LatLng: LatLng = [lat + metersToLat(r), lng];
+          const p2LatLng: LatLng = [lat, lng + metersToLon(r, lat)];
+          const p3LatLng: LatLng = [lat - metersToLat(r), lng];
+
+          // push as [lon, lat]
+          points.push(
+            [lng, lat],
+            [p1LatLng[1], p1LatLng[0]],
+            [p2LatLng[1], p2LatLng[0]],
+            [p3LatLng[1], p3LatLng[0]],
+            [lng, lat]
+          );
         }
 
         const ghUrl = new URL("https://graphhopper.com/api/1/route");
@@ -187,7 +217,8 @@ export default async function handler(req: Request): Promise<Response> {
 
         const path = ghJson?.paths?.[0];
         const coordsLonLat: any[] = path?.points?.coordinates || [];
-        if (!coordsLonLat.length) throw new Error("GraphHopper returned no coordinates");
+        if (!coordsLonLat.length)
+          throw new Error("GraphHopper returned no coordinates");
 
         // Elev profile from GH if it includes altitude in third dimension
         let elevProfile: { distanceMeters: number; elevation: number }[] = [];
@@ -196,7 +227,8 @@ export default async function handler(req: Request): Promise<Response> {
           .filter((n) => typeof n === "number");
 
         if (altitudes.length > 2) {
-          const total = typeof path?.distance === "number" ? path.distance : targetMeters;
+          const total =
+            typeof path?.distance === "number" ? path.distance : targetMeters;
           const step = total / (altitudes.length - 1);
           elevProfile = altitudes.map((e: number, i: number) => ({
             distanceMeters: i * step,
@@ -210,7 +242,8 @@ export default async function handler(req: Request): Promise<Response> {
         const score = scoreRoute(ascent, pref);
 
         const distanceMiles =
-          (typeof path?.distance === "number" ? path.distance : targetMeters) / 1609.34;
+          (typeof path?.distance === "number" ? path.distance : targetMeters) /
+          1609.34;
 
         const timeMinutes =
           typeof path?.time === "number"
@@ -252,8 +285,16 @@ export default async function handler(req: Request): Promise<Response> {
             ? makeOutAndBack(startLonLat, meters3, bearing + 70)
             : makeLoop(startLonLat, meters3, pref);
 
-        const elev2 = fakeElevationProfile(meters2, pref, pref === "hills" ? 0.9 : 0.8);
-        const elev3 = fakeElevationProfile(meters3, pref, pref === "hills" ? 1.5 : 1.25);
+        const elev2 = fakeElevationProfile(
+          meters2,
+          pref,
+          pref === "hills" ? 0.9 : 0.8
+        );
+        const elev3 = fakeElevationProfile(
+          meters3,
+          pref,
+          pref === "hills" ? 1.5 : 1.25
+        );
 
         const asc2 = computeAscent(elev2);
         const asc3 = computeAscent(elev3);
@@ -298,7 +339,10 @@ export default async function handler(req: Request): Promise<Response> {
         });
       } catch (e: any) {
         // Fall through to mock
-        console.warn("GraphHopper route failed, falling back to mock:", e?.message || e);
+        console.warn(
+          "GraphHopper route failed, falling back to mock:",
+          e?.message || e
+        );
       }
     }
 
@@ -325,9 +369,21 @@ export default async function handler(req: Request): Promise<Response> {
         : makeLoop(startLonLat, meters3, pref);
 
     // ✅ different intensities => different ascent => different score
-    const elev1 = fakeElevationProfile(meters1, pref, pref === "hills" ? 1.0 : 1.0);
-    const elev2 = fakeElevationProfile(meters2, pref, pref === "hills" ? 0.85 : 0.8);
-    const elev3 = fakeElevationProfile(meters3, pref, pref === "hills" ? 1.55 : 1.25);
+    const elev1 = fakeElevationProfile(
+      meters1,
+      pref,
+      pref === "hills" ? 1.0 : 1.0
+    );
+    const elev2 = fakeElevationProfile(
+      meters2,
+      pref,
+      pref === "hills" ? 0.85 : 0.8
+    );
+    const elev3 = fakeElevationProfile(
+      meters3,
+      pref,
+      pref === "hills" ? 1.55 : 1.25
+    );
 
     const asc1 = computeAscent(elev1);
     const asc2 = computeAscent(elev2);
@@ -390,6 +446,9 @@ export default async function handler(req: Request): Promise<Response> {
     });
   } catch (e: any) {
     console.error(e);
-    return Response.json({ error: e?.message || "Server error" }, { status: 500 });
+    return Response.json(
+      { error: e?.message || "Server error" },
+      { status: 500 }
+    );
   }
 }
