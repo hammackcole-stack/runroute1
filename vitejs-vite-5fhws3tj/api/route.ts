@@ -1,5 +1,4 @@
 // api/route.ts
-import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 type LatLng = [number, number]; // [lat, lng]
 type LonLat = [number, number]; // [lon, lat]
@@ -70,19 +69,13 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills") {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   try {
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Use POST" });
     }
 
-    const {
-      startLatLng,
-      routeType,
-      targetMeters,
-      elevationPref,
-      directionSeed,
-    } = req.body || {};
+    const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } = req.body || {};
 
     if (!startLatLng || !Array.isArray(startLatLng) || startLatLng.length !== 2) {
       return res.status(400).json({ error: "Missing startLatLng: [lat,lng]" });
@@ -98,24 +91,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const startLonLat: LonLat = [lng, lat];
 
     // Cycle bearings so "Generate" changes direction
-    const candidates = pref === "hills"
-      ? [25, 70, 115, 160, 205, 250, 295, 340]
-      : [0, 90, 180, 270, 45, 135, 225, 315];
+    const candidates =
+      pref === "hills" ? [25, 70, 115, 160, 205, 250, 295, 340] : [0, 90, 180, 270, 45, 135, 225, 315];
     const seedNum = typeof directionSeed === "number" ? directionSeed : 0;
     const bearing = candidates[seedNum % candidates.length];
 
     // ----------------------------
     // Try GraphHopper (real roads)
     // ----------------------------
-    const GH_KEY = process.env.VITE_GH_KEY || process.env.GH_KEY;
+    const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
     if (GH_KEY) {
       try {
-        // We’ll do out-and-back by routing start -> point in direction -> start
-        // For loop we’ll approximate with start -> 3 points -> start.
+        // Out-and-back: route start -> point in direction -> start
+        // Loop: approximate start -> 3 points -> start
         const points: LatLng[] = [];
 
         if (type === "out-and-back") {
-          // create a target point based on bearing and half-distance
           const oneWay = targetMeters / 2;
           const b = (bearing * Math.PI) / 180;
           const dLon = metersToLon(oneWay * Math.cos(b), lat);
@@ -123,7 +114,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const mid: LatLng = [lat + dLat, lng + dLon];
           points.push([lat, lng], mid, [lat, lng]);
         } else {
-          // loop: 3 anchor points around the circle + start
           const r = targetMeters / (2 * Math.PI);
           const p1: LatLng = [lat + metersToLat(r), lng];
           const p2: LatLng = [lat, lng + metersToLon(r, lat)];
@@ -135,7 +125,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const ghUrl = new URL("https://graphhopper.com/api/1/route");
         ghUrl.searchParams.set("key", GH_KEY);
         ghUrl.searchParams.set("points_encoded", "false");
-        ghUrl.searchParams.set("profile", "foot"); // "foot" tends to choose paths/trails better than "car"
+        ghUrl.searchParams.set("profile", "foot");
         ghUrl.searchParams.set("instructions", "false");
         ghUrl.searchParams.set("calc_points", "true");
         ghUrl.searchParams.set("elevation", "true");
@@ -157,9 +147,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         // Build elevation profile (if GH elevation is present)
         let elevProfile: { distanceMeters: number; elevation: number }[] = [];
-        const ghElev = path?.points?.coordinates?.map((c: any) => c[2]).filter((n: any) => typeof n === "number");
+        const ghElev = path?.points?.coordinates
+          ?.map((c: any) => c[2])
+          .filter((n: any) => typeof n === "number");
+
         if (ghElev?.length) {
-          // Simple distance axis: spread over total distance
           const total = typeof path?.distance === "number" ? path.distance : targetMeters;
           const step = total / (ghElev.length - 1);
           elevProfile = ghElev.map((e: number, i: number) => ({
@@ -176,14 +168,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const distanceMiles = (path.distance / 1609.34) || (targetMeters / 1609.34);
         const timeMinutes = path.time ? Math.round(path.time / 1000 / 60) : Math.round(distanceMiles * 10);
 
-        // Return 3 “options” by varying the seed/bearing slightly:
-        // For now we’ll just return the SAME GH path as Route 1,
-        // and two slightly rotated FALLBACK paths as Routes 2/3.
+        // Route 1: GraphHopper result
         const feature1 = {
           type: "Feature",
           geometry: { type: "LineString", coordinates: coordsLonLat.map((c: any) => [c[0], c[1]]) },
           properties: {
-            metrics: { distanceMiles: Number(distanceMiles.toFixed(2)), timeMinutes, totalAscent: ascent, totalDescent: ascent },
+            metrics: {
+              distanceMiles: Number(distanceMiles.toFixed(2)),
+              timeMinutes,
+              totalAscent: ascent,
+              totalDescent: ascent,
+            },
             scoring: { overallScore: score },
             warnings: [],
             elevationProfile: elevProfile,
@@ -191,7 +186,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           },
         };
 
-        // Option 2/3 as geometric alternates (for now)
+        // Route 2/3: geometric alternates for now
         const feature2Coords =
           type === "out-and-back"
             ? makeOutAndBack(startLonLat, targetMeters * 0.98, bearing + 35)
@@ -246,7 +241,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           features: [feature1, feature2, feature3],
         });
       } catch (e: any) {
-        // Fall through to mock
         console.warn("GraphHopper route failed, falling back to mock:", e?.message || e);
       }
     }
@@ -254,10 +248,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // ----------------------------
     // Fallback: geometry-only mock
     // ----------------------------
-    const coords1 =
-      type === "out-and-back"
-        ? makeOutAndBack(startLonLat, targetMeters, bearing)
-        : makeLoop(startLonLat, targetMeters, pref);
+    const coords1 = type === "out-and-back" ? makeOutAndBack(startLonLat, targetMeters, bearing) : makeLoop(startLonLat, targetMeters, pref);
 
     const elev1 = fakeElevationProfile(targetMeters, pref);
     const asc1 = computeAscent(elev1);
