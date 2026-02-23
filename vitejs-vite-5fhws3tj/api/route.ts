@@ -154,6 +154,11 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills"): number {
 
 // ── GraphHopper client ────────────────────────────────────────────────────────
 
+/** Small pause between sequential GH calls to stay within free-tier rate limits. */
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function graphHopperRoute(points: LatLon[], key: string, profile: string) {
   // GH POST body expects [lon, lat] — swap after normalizing
   const safePoints = points.map((p, i) => {
@@ -232,6 +237,7 @@ async function buildRouteFeature({
   if (ghKey) {
     try {
       const { path, coords } = await graphHopperRoute(waypoints, ghKey, ghProfile);
+      // (rate-limit errors throw before reaching here)
       const coordsLonLat: LonLat[] = coords.map((c: any) => [c[0], c[1]]);
 
       const altitudes = coords
@@ -276,11 +282,35 @@ async function buildRouteFeature({
         },
       };
     } catch (e: any) {
-      console.warn("GH route failed, using mock fallback:", e?.message ?? e);
+      const msg: string = e?.message ?? String(e);
+      const isRateLimit = msg.toLowerCase().includes("limit");
+      console.warn("GH route failed, using mock fallback:", msg);
+      // Bubble rate-limit errors up with a clear flag so the caller can
+      // surface a useful warning instead of silently showing a mock.
+      if (isRateLimit) {
+        return buildMockFeature(mockCoords, targetMeters, pref, elevIntensity, [
+          "GraphHopper rate limit reached — showing estimated route. Wait a minute and try again.",
+        ]);
+      }
     }
   }
 
-  // Mock fallback
+  return buildMockFeature(
+    mockCoords,
+    targetMeters,
+    pref,
+    elevIntensity,
+    [ghKey ? "Route used mock (GraphHopper failed)." : "Using mock (no GH key)."]
+  );
+}
+
+function buildMockFeature(
+  mockCoords: LonLat[],
+  targetMeters: number,
+  pref: "flat" | "hills",
+  elevIntensity: number,
+  warnings: string[]
+): object {
   const elev = fakeElevationProfile(targetMeters, pref, elevIntensity);
   const asc = computeAscent(elev);
   return {
@@ -294,7 +324,7 @@ async function buildRouteFeature({
         totalDescent: asc,
       },
       scoring: { overallScore: scoreRoute(asc, pref) },
-      warnings: [ghKey ? "Route used mock (GraphHopper failed)." : "Using mock (no GH key)."],
+      warnings,
       elevationProfile: elev,
       source: "mock",
     },
@@ -359,46 +389,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
 
-    // Fire all three GH requests in parallel. buildRouteFeature handles its own
-    // errors internally, so one failure won't block the other two.
-    const [feature1, feature2, feature3] = await Promise.all([
-      buildRouteFeature({
-        waypoints: buildWaypoints(lat, lon, meters1, type, bearing1),
-        mockCoords:
-          type === "out-and-back"
-            ? makeOutAndBack(startLonLat, meters1, bearing1)
-            : makeLoop(startLonLat, meters1, pref),
-        targetMeters: meters1,
-        pref,
-        ghKey: GH_KEY,
-        ghProfile,
-        elevIntensity: 1.0,
-      }),
-      buildRouteFeature({
-        waypoints: buildWaypoints(lat, lon, meters2, type, bearing2),
-        mockCoords:
-          type === "out-and-back"
-            ? makeOutAndBack(startLonLat, meters2, bearing2)
-            : makeLoop(startLonLat, meters2, pref),
-        targetMeters: meters2,
-        pref,
-        ghKey: GH_KEY,
-        ghProfile,
-        elevIntensity: pref === "hills" ? 0.85 : 0.8,
-      }),
-      buildRouteFeature({
-        waypoints: buildWaypoints(lat, lon, meters3, type, bearing3),
-        mockCoords:
-          type === "out-and-back"
-            ? makeOutAndBack(startLonLat, meters3, bearing3)
-            : makeLoop(startLonLat, meters3, pref),
-        targetMeters: meters3,
-        pref,
-        ghKey: GH_KEY,
-        ghProfile,
-        elevIntensity: pref === "hills" ? 1.55 : 1.25,
-      }),
-    ]);
+    // Run GH requests sequentially with a short pause between each.
+    // Parallel calls (Promise.all) blow through the free-tier per-minute limit
+    // almost instantly — sequential keeps burst rate at 1 req at a time.
+    const GH_STAGGER_MS = 300;
+
+    const feature1 = await buildRouteFeature({
+      waypoints: buildWaypoints(lat, lon, meters1, type, bearing1),
+      mockCoords:
+        type === "out-and-back"
+          ? makeOutAndBack(startLonLat, meters1, bearing1)
+          : makeLoop(startLonLat, meters1, pref),
+      targetMeters: meters1,
+      pref,
+      ghKey: GH_KEY,
+      ghProfile,
+      elevIntensity: 1.0,
+    });
+
+    await sleep(GH_STAGGER_MS);
+
+    const feature2 = await buildRouteFeature({
+      waypoints: buildWaypoints(lat, lon, meters2, type, bearing2),
+      mockCoords:
+        type === "out-and-back"
+          ? makeOutAndBack(startLonLat, meters2, bearing2)
+          : makeLoop(startLonLat, meters2, pref),
+      targetMeters: meters2,
+      pref,
+      ghKey: GH_KEY,
+      ghProfile,
+      elevIntensity: pref === "hills" ? 0.85 : 0.8,
+    });
+
+    await sleep(GH_STAGGER_MS);
+
+    const feature3 = await buildRouteFeature({
+      waypoints: buildWaypoints(lat, lon, meters3, type, bearing3),
+      mockCoords:
+        type === "out-and-back"
+          ? makeOutAndBack(startLonLat, meters3, bearing3)
+          : makeLoop(startLonLat, meters3, pref),
+      targetMeters: meters3,
+      pref,
+      ghKey: GH_KEY,
+      ghProfile,
+      elevIntensity: pref === "hills" ? 1.55 : 1.25,
+    });
 
     return res.status(200).json({
       type: "FeatureCollection",
