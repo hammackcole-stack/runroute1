@@ -12,19 +12,15 @@ function metersToLat(m: number) {
 
 function validateLatLng(p: any, label = "point"): asserts p is LatLng {
   if (!Array.isArray(p) || p.length !== 2) {
-    throw new Error(`Invalid ${label}: expected [lat,lng] array`);
+    throw new Error(`Invalid ${label}: expected [lat,lng]`);
   }
   const lat = Number(p[0]);
   const lng = Number(p[1]);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
     throw new Error(`Invalid ${label}: lat/lng must be numbers`);
   }
-  if (lat < -90 || lat > 90) {
-    throw new Error(`Invalid ${label}: lat out of bounds (${lat})`);
-  }
-  if (lng < -180 || lng > 180) {
-    throw new Error(`Invalid ${label}: lng out of bounds (${lng})`);
-  }
+  if (lat < -90 || lat > 90) throw new Error(`Invalid ${label}: lat out of bounds (${lat})`);
+  if (lng < -180 || lng > 180) throw new Error(`Invalid ${label}: lng out of bounds (${lng})`);
 }
 
 // Simple geometry generators (fallback if GraphHopper fails)
@@ -88,41 +84,41 @@ function scoreRoute(ascentMeters: number, pref: "flat" | "hills") {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
-// Helper to safely read JSON body
-async function readJson(req: Request): Promise<any> {
-  try {
-    return await req.json();
-  } catch {
-    return null;
-  }
+function withTimeout<T>(promise: Promise<T>, ms: number) {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
+    promise
+      .then((v) => {
+        clearTimeout(id);
+        resolve(v);
+      })
+      .catch((e) => {
+        clearTimeout(id);
+        reject(e);
+      });
+  });
 }
 
-function abortableTimeout(ms: number) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, cancel: () => clearTimeout(id) };
-}
-
-export const config = {
-  runtime: "nodejs",
-};
-
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(req: any, res: any) {
   try {
+    // IMPORTANT: always respond to GET fast (for debugging)
     if (req.method === "GET") {
-      return Response.json({ ok: true, message: "API is alive. Use POST to generate routes." });
-    }
-    if (req.method !== "POST") {
-      return Response.json({ error: "Use POST" }, { status: 405 });
+      return res.status(200).json({ ok: true, message: "API is alive. Use POST to generate routes." });
     }
 
-    const body = await readJson(req);
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Use POST" });
+    }
+
+    // Vercel usually parses JSON body for you, but handle string just in case
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
     const { startLatLng, routeType, targetMeters, elevationPref, directionSeed } = body || {};
 
     validateLatLng(startLatLng, "startLatLng");
 
     if (typeof targetMeters !== "number" || !Number.isFinite(targetMeters) || targetMeters <= 0) {
-      return Response.json({ error: "Missing/invalid targetMeters (number)" }, { status: 400 });
+      return res.status(400).json({ error: "Missing/invalid targetMeters (number)" });
     }
 
     const pref: "flat" | "hills" = elevationPref === "hills" ? "hills" : "flat";
@@ -131,7 +127,6 @@ export default async function handler(req: Request): Promise<Response> {
     const [lat, lng] = startLatLng as LatLng;
     const startLonLat: LonLat = [lng, lat];
 
-    // Cycle bearings so "Generate" changes direction
     const candidates =
       pref === "hills"
         ? [25, 70, 115, 160, 205, 250, 295, 340]
@@ -142,9 +137,7 @@ export default async function handler(req: Request): Promise<Response> {
 
     const GH_KEY = process.env.GH_KEY || process.env.VITE_GH_KEY;
 
-    // ----------------------------
-    // Try GraphHopper (real roads) with a hard timeout
-    // ----------------------------
+    // ---- GraphHopper attempt (fast-fail) ----
     if (GH_KEY) {
       try {
         const points: LatLng[] = [];
@@ -181,60 +174,47 @@ export default async function handler(req: Request): Promise<Response> {
         ghUrl.searchParams.set("calc_points", "true");
         ghUrl.searchParams.set("elevation", "true");
 
-        const t = abortableTimeout(8000);
-        const ghResp = await fetch(ghUrl.toString(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ points }),
-          signal: t.signal,
-        }).finally(() => t.cancel());
+        const ghResp = await withTimeout(
+          fetch(ghUrl.toString(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ points }),
+          }),
+          8000
+        );
 
         const ghJson: any = await ghResp.json();
 
         if (!ghResp.ok) {
-          const msg =
-            ghJson?.message ||
-            ghJson?.error ||
-            `GraphHopper error (status ${ghResp.status})`;
-          throw new Error(msg);
+          throw new Error(ghJson?.message || ghJson?.error || `GraphHopper error (${ghResp.status})`);
         }
 
         const path = ghJson?.paths?.[0];
         const coordsLonLat: any[] = path?.points?.coordinates || [];
         if (!coordsLonLat.length) throw new Error("GraphHopper returned no coordinates");
 
-        // Elevation profile
-        let elevProfile: { distanceMeters: number; elevation: number }[] = [];
         const altitudes = coordsLonLat.map((c) => c?.[2]).filter((n) => typeof n === "number");
 
-        if (altitudes.length > 2) {
-          const total = typeof path?.distance === "number" ? path.distance : targetMeters;
-          const step = total / (altitudes.length - 1);
-          elevProfile = altitudes.map((e: number, i: number) => ({
-            distanceMeters: i * step,
-            elevation: Math.round(e),
-          }));
-        } else {
-          elevProfile = fakeElevationProfile(targetMeters, pref, 1);
-        }
+        const totalMeters = typeof path?.distance === "number" ? path.distance : targetMeters;
+
+        const elevProfile =
+          altitudes.length > 2
+            ? altitudes.map((e: number, i: number) => ({
+                distanceMeters: (i * totalMeters) / (altitudes.length - 1),
+                elevation: Math.round(e),
+              }))
+            : fakeElevationProfile(targetMeters, pref, 1.0);
 
         const ascent = computeAscent(elevProfile);
         const score = scoreRoute(ascent, pref);
 
-        const distanceMetersSafe = typeof path?.distance === "number" ? path.distance : targetMeters;
-        const distanceMiles = distanceMetersSafe / 1609.34;
-
+        const distanceMiles = totalMeters / 1609.34;
         const timeMinutes =
-          typeof path?.time === "number"
-            ? Math.round(path.time / 1000 / 60)
-            : Math.round(distanceMiles * 10);
+          typeof path?.time === "number" ? Math.round(path.time / 1000 / 60) : Math.round(distanceMiles * 10);
 
         const feature1 = {
           type: "Feature",
-          geometry: {
-            type: "LineString",
-            coordinates: coordsLonLat.map((c) => [c[0], c[1]]), // [lon,lat]
-          },
+          geometry: { type: "LineString", coordinates: coordsLonLat.map((c) => [c[0], c[1]]) },
           properties: {
             metrics: {
               distanceMiles: Number(distanceMiles.toFixed(2)),
@@ -249,7 +229,7 @@ export default async function handler(req: Request): Promise<Response> {
           },
         };
 
-        // mock alternates with different elevation intensities
+        // Alternates: mock w/ different elevation intensities
         const meters2 = targetMeters * 0.98;
         const meters3 = targetMeters * 1.02;
 
@@ -257,7 +237,6 @@ export default async function handler(req: Request): Promise<Response> {
           type === "out-and-back"
             ? makeOutAndBack(startLonLat, meters2, bearing + 35)
             : makeLoop(startLonLat, meters2, pref);
-
         const feature3Coords =
           type === "out-and-back"
             ? makeOutAndBack(startLonLat, meters3, bearing + 70)
@@ -303,16 +282,13 @@ export default async function handler(req: Request): Promise<Response> {
           },
         };
 
-        return Response.json({ type: "FeatureCollection", features: [feature1, feature2, feature3] });
+        return res.status(200).json({ type: "FeatureCollection", features: [feature1, feature2, feature3] });
       } catch (e: any) {
-        // IMPORTANT: fail fast and fall back
         console.warn("GraphHopper route failed, falling back to mock:", e?.message || e);
       }
     }
 
-    // ----------------------------
-    // Fallback: geometry-only mock (different elevation per route)
-    // ----------------------------
+    // ---- Mock fallback (always fast) ----
     const meters1 = targetMeters;
     const meters2 = targetMeters * 0.98;
     const meters3 = targetMeters * 1.02;
@@ -332,7 +308,9 @@ export default async function handler(req: Request): Promise<Response> {
     const asc2 = computeAscent(elev2);
     const asc3 = computeAscent(elev3);
 
-    return Response.json({
+    const warn = GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server yet.";
+
+    return res.status(200).json({
       type: "FeatureCollection",
       features: [
         {
@@ -346,7 +324,7 @@ export default async function handler(req: Request): Promise<Response> {
               totalDescent: asc1,
             },
             scoring: { overallScore: scoreRoute(asc1, pref) },
-            warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server yet."],
+            warnings: [warn],
             elevationProfile: elev1,
             source: "mock",
           },
@@ -362,7 +340,7 @@ export default async function handler(req: Request): Promise<Response> {
               totalDescent: asc2,
             },
             scoring: { overallScore: scoreRoute(asc2, pref) },
-            warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server yet."],
+            warnings: [warn],
             elevationProfile: elev2,
             source: "mock",
           },
@@ -378,7 +356,7 @@ export default async function handler(req: Request): Promise<Response> {
               totalDescent: asc3,
             },
             scoring: { overallScore: scoreRoute(asc3, pref) },
-            warnings: [GH_KEY ? "GraphHopper failed; using mock." : "Mock mode: no GH_KEY env var found on server yet."],
+            warnings: [warn],
             elevationProfile: elev3,
             source: "mock",
           },
@@ -387,6 +365,6 @@ export default async function handler(req: Request): Promise<Response> {
     });
   } catch (e: any) {
     console.error(e);
-    return Response.json({ error: e?.message || "Server error" }, { status: 500 });
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 }
