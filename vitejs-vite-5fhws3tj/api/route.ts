@@ -125,13 +125,21 @@ async function graphHopperRoute(points: LatLon[], key: string) {
     return [lon, lat];
   });
 
+  // Only the API key goes in the query string for POST requests.
+  // All routing options must be in the body — GH ignores query params like
+  // points_encoded on POST, which caused it to return an encoded polyline
+  // string instead of a GeoJSON coordinate array.
   const ghUrl = new URL("https://graphhopper.com/api/1/route");
   ghUrl.searchParams.set("key", key);
-  ghUrl.searchParams.set("points_encoded", "false");
-  ghUrl.searchParams.set("profile", "foot");
-  ghUrl.searchParams.set("instructions", "false");
-  ghUrl.searchParams.set("calc_points", "true");
-  ghUrl.searchParams.set("elevation", "true");
+
+  const requestBody = {
+    points: safePoints,
+    profile: "foot",
+    points_encoded: false,
+    instructions: false,
+    calc_points: true,
+    elevation: true,
+  };
 
   // Hard timeout — prevents the POST from hanging if GH is slow/unreachable
   const controller = new AbortController();
@@ -142,7 +150,7 @@ async function graphHopperRoute(points: LatLon[], key: string) {
     ghResp = await fetch(ghUrl.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ points: safePoints }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
   } finally {
@@ -158,7 +166,11 @@ async function graphHopperRoute(points: LatLon[], key: string) {
 
   const path = ghJson?.paths?.[0];
   const coords: any[] = path?.points?.coordinates ?? [];
-  if (!coords.length) throw new Error("GraphHopper returned no coordinates");
+  if (!coords.length) {
+    // Log the raw response so the next error gives us something to work with
+    console.error("GH response missing coordinates:", JSON.stringify(ghJson).slice(0, 500));
+    throw new Error("GraphHopper returned no coordinates");
+  }
 
   return { path, coords };
 }
