@@ -556,10 +556,11 @@ const elevationProfile =
 
             <div className="h-24 w-full mt-4">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart
-                  data={elevationProfile}
-                  margin={{ top: 5, right: 0, left: -20, bottom: 0 }}
-                >
+               <AreaChart
+  key={`elev-${selectedRouteIndex}-${routeFadeKey}`}
+  data={elevationProfile}
+  margin={{ top: 5, right: 0, left: -20, bottom: 0 }}
+>
                   <defs>
                     <linearGradient
                       id="colorElevation"
