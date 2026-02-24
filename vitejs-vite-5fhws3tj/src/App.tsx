@@ -3,6 +3,8 @@ import {
   CircleMarker,
   GeoJSON,
   MapContainer,
+  Marker,
+  Polyline,
   Popup,
   TileLayer,
   useMap,
@@ -56,6 +58,128 @@ function StartUpdater({ startLatLng }: { startLatLng: [number, number] | null })
   return null;
 }
 
+// ── gradient + arrow helpers ──────────────────────────────────────────────────
+
+const GRAD_COLOR_START = '#f0ff80'; // pale lime-yellow
+const GRAD_COLOR_END   = '#ccff00'; // neon green
+const N_GRAD_SEGMENTS  = 40;
+const ARROW_FRACS      = [0.12, 0.28, 0.46, 0.64, 0.80, 0.93];
+
+function lerpColor(colorA: string, colorB: string, t: number): string {
+  const parse = (hex: string): [number, number, number] => [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16),
+  ];
+  const [ar, ag, ab] = parse(colorA);
+  const [br, bg, bb] = parse(colorB);
+  const r = Math.round(ar + (br - ar) * t);
+  const g = Math.round(ag + (bg - ag) * t);
+  const b = Math.round(ab + (bb - ab) * t);
+  const h = (n: number) => n.toString(16).padStart(2, '0');
+  return '#' + h(r) + h(g) + h(b);
+}
+
+function bearingDeg(fromLatLng: [number, number], toLatLng: [number, number]): number {
+  const dLon = (toLatLng[1] - fromLatLng[1]) * (Math.PI / 180);
+  const lat1 = fromLatLng[0] * (Math.PI / 180);
+  const lat2 = toLatLng[0] * (Math.PI / 180);
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return (Math.atan2(y, x) * (180 / Math.PI) + 360) % 360;
+}
+
+function signLabel(sign: number): string {
+  if (sign === -3) return 'Sharp L';
+  if (sign === -2) return 'Left';
+  if (sign === -1) return 'Bear L';
+  if (sign === 0)  return 'Straight';
+  if (sign === 1)  return 'Bear R';
+  if (sign === 2)  return 'Right';
+  if (sign === 3)  return 'Sharp R';
+  if (sign === 4)  return 'Finish';
+  if (sign === 5)  return 'Waypoint';
+  if (sign === 6)  return 'Roundabout';
+  if (sign === 7)  return 'Keep L';
+  if (sign === 8)  return 'Keep R';
+  return 'Continue';
+}
+
+/** Renders the selected route as a gradient polyline from pale lime to neon green. */
+function GradientPolyline({ feature }: { feature: any }) {
+  const segments = useMemo(() => {
+    const raw: any[] = feature?.geometry?.coordinates ?? [];
+    const latLngs: [number, number][] = raw.map((c: any) => [c[1], c[0]]);
+    if (latLngs.length < 2) return [];
+    const n = latLngs.length;
+    const step = Math.max(1, Math.floor(n / N_GRAD_SEGMENTS));
+    const result: { positions: [number, number][]; t: number }[] = [];
+    for (let i = 0; i < n - 1; i += step) {
+      const end = Math.min(i + step + 1, n);
+      result.push({ positions: latLngs.slice(i, end), t: i / (n - 1) });
+    }
+    return result;
+  }, [feature]);
+
+  return (
+    <>
+      {segments.map((seg, i) => (
+        <Polyline
+          key={i}
+          positions={seg.positions}
+          pathOptions={{
+            color: lerpColor(GRAD_COLOR_START, GRAD_COLOR_END, seg.t),
+            weight: 6,
+            opacity: 0.95,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+/** Places rotated triangle markers along the selected route to show direction. */
+function RouteArrows({ feature }: { feature: any }) {
+  const arrows = useMemo(() => {
+    const raw: any[] = feature?.geometry?.coordinates ?? [];
+    const latLngs: [number, number][] = raw.map((c: any) => [c[1], c[0]]);
+    const n = latLngs.length;
+    if (n < 3) return [];
+    return ARROW_FRACS.map((frac) => {
+      const idx = Math.min(Math.floor(frac * (n - 1)), n - 2);
+      const from = latLngs[idx];
+      const to   = latLngs[idx + 1];
+      const deg  = bearingDeg(from, to);
+      const col  = lerpColor(GRAD_COLOR_START, GRAD_COLOR_END, frac);
+      return { latlng: latLngs[idx], deg, col };
+    });
+  }, [feature]);
+
+  return (
+    <>
+      {arrows.map((arrow, i) => {
+        const icon = L.divIcon({
+          className: '',
+          html:
+            '<div style="pointer-events:none;width:0;height:0;' +
+            'border-left:5px solid transparent;' +
+            'border-right:5px solid transparent;' +
+            'border-bottom:13px solid ' + arrow.col + ';' +
+            'transform:rotate(' + String(Math.round(arrow.deg)) + 'deg);' +
+            'transform-origin:center 65%;"></div>',
+          iconSize: [10, 13],
+          iconAnchor: [5, 6],
+        });
+        return <Marker key={i} position={arrow.latlng} icon={icon} />;
+      })}
+    </>
+  );
+}
+
+// ── home address ──────────────────────────────────────────────────────────────
+
 const HOME_ADDRESS = "1563 Lucretia Ave Los Angeles, CA 90026";
 const HOME_LATLNG: [number, number] = [34.0822, -118.2559]; // [lat, lon]
 
@@ -92,6 +216,7 @@ export default function App() {
   const [selectedRouteIndex, setSelectedRouteIndex] = useState<number>(0);
   const [hoveredRouteIndex, setHoveredRouteIndex] = useState<number | null>(null);
   const [routeFadeKey, setRouteFadeKey] = useState(0);
+  const [showDirections, setShowDirections] = useState(false);
 
   // Load last route from localStorage (on first mount)
   useEffect(() => {
@@ -149,6 +274,7 @@ export default function App() {
   const warnings: string[] = (properties?.warnings as string[]) ?? [];
   const elevationProfile =
     (properties?.elevationProfile as { distanceMeters: number; elevation: number }[]) ?? [];
+  const directionSteps: any[] = (properties?.instructions as any[]) ?? [];
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -507,6 +633,42 @@ export default function App() {
             </div>
           )}
 
+          {/* DIRECTIONS PANEL */}
+          {directionSteps.length > 0 && (
+            <div className="mt-8 pb-2">
+              <button
+                type="button"
+                onClick={() => setShowDirections((v) => !v)}
+                className="w-full flex justify-between items-center text-[10px] font-bold text-zinc-600 uppercase tracking-[0.2em] mb-3 hover:text-zinc-400 transition-colors"
+              >
+                <span>Directions</span>
+                <span className="text-base leading-none">{showDirections ? '\u2212' : '+'}</span>
+              </button>
+              {showDirections && (
+                <div className="space-y-0 max-h-72 overflow-y-auto border border-zinc-900">
+                  {directionSteps.map((step: any, i: number) => (
+                    <div
+                      key={i}
+                      className="flex gap-3 px-3 py-2 border-b border-zinc-900 last:border-0 hover:bg-zinc-950 transition-colors"
+                    >
+                      <span className="text-[9px] font-black text-neon uppercase tracking-wider w-14 shrink-0 pt-0.5 leading-tight">
+                        {signLabel(step.sign)}
+                      </span>
+                      <span className="text-[10px] text-zinc-400 flex-1 leading-relaxed">
+                        {step.text}
+                      </span>
+                      {step.distanceMiles > 0 && (
+                        <span className="text-[9px] text-zinc-600 shrink-0 font-mono pt-0.5">
+                          {step.distanceMiles}mi
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {routeData?.features?.length ? (
             <div className="mt-10 flex flex-col gap-4 pb-8">
               <h2 className="text-[10px] font-bold text-zinc-600 uppercase tracking-[0.2em]">
@@ -639,10 +801,26 @@ export default function App() {
               </CircleMarker>
             )}
 
-            {/* SHOW ALL ROUTES */}
-            {routeData?.features?.map((feature: any, idx: number) => (
-              <GeoJSON key={`route-${idx}-${routeFadeKey}-${hoveredRouteIndex}`} data={feature} style={routeStyle(idx)} />
-            ))}
+            {/* SHOW ALL ROUTES — unselected rendered as flat GeoJSON */}
+            {routeData?.features?.map((feature: any, idx: number) =>
+              idx !== selectedRouteIndex ? (
+                <GeoJSON key={`route-${idx}-${routeFadeKey}-${hoveredRouteIndex}`} data={feature} style={routeStyle(idx)} />
+              ) : null
+            )}
+
+            {/* SELECTED ROUTE — gradient polyline + direction arrows */}
+            {selectedFeature && (
+              <GradientPolyline
+                key={`grad-${selectedRouteIndex}-${routeFadeKey}`}
+                feature={selectedFeature}
+              />
+            )}
+            {selectedFeature && (
+              <RouteArrows
+                key={`arrows-${selectedRouteIndex}-${routeFadeKey}`}
+                feature={selectedFeature}
+              />
+            )}
 
             {/* Park center marker for park loop routes */}
             {selectedFeature?.properties?.parkLat != null && (
