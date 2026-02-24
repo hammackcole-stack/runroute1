@@ -190,7 +190,7 @@ async function graphHopperRoute(
     points: safePoints,
     profile,
     points_encoded: false,
-    instructions: false,
+    instructions: true,
     calc_points: true,
     elevation: true,
   };
@@ -243,7 +243,7 @@ async function ghRoundTrip(
     "round_trip.seed": seed,
     profile,
     points_encoded: false,
-    instructions: false,
+    instructions: true,
     calc_points: true,
     elevation: true,
   };
@@ -443,6 +443,14 @@ function parseGHFeature(
       ? Math.round(path.time / 1000 / 60)
       : Math.round(distanceMiles * 10);
 
+  const rawInstr: any[] = path?.instructions ?? [];
+  const instructions = rawInstr.map((inst: any) => {
+    const txt = String(inst.text ?? '');
+    const mi = Number(((inst.distance ?? 0) / 1609.34).toFixed(2));
+    const sign = typeof inst.sign === 'number' ? inst.sign : 0;
+    return { text: txt, distanceMiles: mi, sign };
+  });
+
   return {
     type: "Feature",
     geometry: { type: "LineString", coordinates: coordsLonLat },
@@ -456,6 +464,7 @@ function parseGHFeature(
       scoring: { overallScore: scoreRoute(ascent, pref) },
       warnings: [],
       elevationProfile: elevProfile,
+      instructions,
       source: "graphhopper",
     },
   };
@@ -476,7 +485,8 @@ function buildCombinedFeature(
   allAltitudes: number[],
   targetMeters: number,
   pref: "flat" | "hills",
-  elevIntensity: number
+  elevIntensity: number,
+  instructions?: any[]
 ): object {
   let elevProfile: { distanceMeters: number; elevation: number }[];
   if (allAltitudes.length > 2) {
@@ -509,6 +519,7 @@ function buildCombinedFeature(
       scoring: { overallScore: scoreRoute(ascent, pref) },
       warnings: [],
       elevationProfile: elevProfile,
+      instructions: instructions ?? [],
       source: "graphhopper",
     },
   };
@@ -611,10 +622,39 @@ async function buildParkLoopFeature({
     const totalDistance = toDistance * 2 + loopActualDistance;
     const totalTime = toTime * 2 + loopTime;
 
+    // ── stitch instructions ───────────────────────────────────────────────────
+    const toRawInstr: any[] = toPath?.instructions ?? [];
+    const lapRawInstr: any[] = loopPath?.instructions ?? [];
+
+    const toInstructions = toRawInstr
+      .filter((inst: any) => inst.sign !== 4) // drop final "arrived" step
+      .map((inst: any) => {
+        const txt = String(inst.text ?? '');
+        const mi = Number(((inst.distance ?? 0) / 1609.34).toFixed(2));
+        const sign = typeof inst.sign === 'number' ? inst.sign : 0;
+        return { text: txt, distanceMiles: mi, sign };
+      });
+
+    const lapInstructions = lapRawInstr.map((inst: any) => {
+      const txt = String(inst.text ?? '');
+      const mi = Number(((inst.distance ?? 0) / 1609.34).toFixed(2));
+      const sign = typeof inst.sign === 'number' ? inst.sign : 0;
+      return { text: txt, distanceMiles: mi, sign };
+    });
+
+    const parkLabel = (parkName ? parkName : 'Park') + ' \u2014 ' + String(laps) + (laps === 1 ? ' lap' : ' laps');
+    const parkHeader = { text: parkLabel, distanceMiles: 0, sign: 0 };
+    const returnNote = {
+      text: 'Retrace your route back to start',
+      distanceMiles: Number(((toDistance * 2) / 1609.34).toFixed(2)),
+      sign: 4,
+    };
+    const combinedInstructions = [...toInstructions, parkHeader, ...lapInstructions, returnNote];
+
     // Build feature then annotate with park-specific metadata
     const feature = buildCombinedFeature(
       allCoords, totalDistance, totalTime, allAlts,
-      targetMeters, pref, elevIntensity
+      targetMeters, pref, elevIntensity, combinedInstructions
     ) as any;
 
     feature.properties.parkName = parkName ?? null;
